@@ -16,7 +16,7 @@ sha1-ring = ["sha1w/sha1-ring"]
 
 [dependencies]
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net"] }
 hex.workspace = true
 anyhow.workspace = true
 url.workspace = true
