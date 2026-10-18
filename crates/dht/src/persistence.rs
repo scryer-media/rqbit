@@ -4,6 +4,7 @@ use anyhow::Context;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use librqbit_core::directories::get_configuration_directory;
+use librqbit_core::net::DatagramSocket;
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use librqbit_dualstack_sockets::BindDevice;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -109,6 +111,31 @@ impl PersistentDht {
         cancellation_token: Option<CancellationToken>,
         bind_device: Option<&'a BindDevice>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
+        Self::create_with_socket(
+            persistence_config,
+            port,
+            ipv4_only,
+            bootstrap_addrs,
+            cancellation_token,
+            bind_device,
+            None,
+        )
+    }
+
+    /// Like [`PersistentDht::create`], but when `socket` is set the DHT sends
+    /// and receives through it instead of binding a kernel UDP socket. In that
+    /// case `port`, `ipv4_only`, `bind_device` and any persisted port are
+    /// ignored.
+    #[inline(never)]
+    pub fn create_with_socket<'a>(
+        persistence_config: DhtPersistenceConfig,
+        port: Option<u16>,
+        ipv4_only: bool,
+        bootstrap_addrs: Option<Vec<String>>,
+        cancellation_token: Option<CancellationToken>,
+        bind_device: Option<&'a BindDevice>,
+        socket: Option<Arc<dyn DatagramSocket>>,
+    ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {
             let config_filename = match persistence_config.config_filename {
                 Some(f) => f,
@@ -168,6 +195,7 @@ impl PersistentDht {
                 peer_store,
                 cancellation_token,
                 bind_device,
+                socket,
                 ..Default::default()
             };
             let dht = DhtState::with_config(dht_config).await?;

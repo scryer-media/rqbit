@@ -31,6 +31,7 @@ use librqbit_core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     crate_version,
     hash_id::Id20,
+    net::DatagramSocket,
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
 };
@@ -964,8 +965,40 @@ impl core::fmt::Debug for ResponseOrError {
     }
 }
 
+/// The socket the DHT talks through.
+///
+/// The kernel socket is called directly; a custom transport goes through the
+/// [`DatagramSocket`] trait object.
+enum DhtSocket {
+    Udp(UdpSocket),
+    Custom(Arc<dyn DatagramSocket>),
+}
+
+impl DhtSocket {
+    fn bind_addr(&self) -> SocketAddr {
+        match self {
+            Self::Udp(sock) => sock.bind_addr(),
+            Self::Custom(sock) => sock.bind_addr(),
+        }
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(sock) => sock.recv_from(buf).await,
+            Self::Custom(sock) => sock.recv_from(buf).await,
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(sock) => sock.send_to(buf, target).await,
+            Self::Custom(sock) => sock.send_to(buf, target).await,
+        }
+    }
+}
+
 struct DhtWorker {
-    socket: UdpSocket,
+    socket: DhtSocket,
     dht: Arc<DhtState>,
 }
 
@@ -1163,7 +1196,7 @@ impl DhtWorker {
 
     async fn framer(
         &self,
-        socket: &UdpSocket,
+        socket: &DhtSocket,
         mut input_rx: UnboundedReceiver<WorkerSendRequest>,
         output_tx: Sender<(Message<ByteBufOwned>, SocketAddr)>,
     ) -> crate::Result<()> {
@@ -1306,6 +1339,11 @@ pub struct DhtConfig<'a> {
     pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
     pub bind_device: Option<&'a BindDevice>,
+    /// Send and receive DHT traffic through this socket instead of binding a
+    /// kernel UDP socket. When set, `listen_addr` and `bind_device` are
+    /// ignored and the DHT reports the socket's `bind_addr()` as its listen
+    /// address.
+    pub socket: Option<Arc<dyn DatagramSocket>>,
 }
 
 impl DhtState {
@@ -1319,18 +1357,25 @@ impl DhtState {
     #[inline(never)]
     pub fn with_config<'a>(mut config: DhtConfig<'a>) -> BoxFuture<'a, crate::Result<Arc<Self>>> {
         async move {
-            let addr = config
-                .listen_addr
-                .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
-            let socket = UdpSocket::bind_udp(
-                addr,
-                librqbit_dualstack_sockets::BindOpts {
-                    request_dualstack: true,
-                    reuseport: false,
-                    device: config.bind_device,
-                },
-            )
-            .map_err(|e| Error::Bind(Box::new(e)))?;
+            let socket = match config.socket.take() {
+                Some(socket) => DhtSocket::Custom(socket),
+                None => {
+                    let addr = config
+                        .listen_addr
+                        .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
+                    DhtSocket::Udp(
+                        UdpSocket::bind_udp(
+                            addr,
+                            librqbit_dualstack_sockets::BindOpts {
+                                request_dualstack: true,
+                                reuseport: false,
+                                device: config.bind_device,
+                            },
+                        )
+                        .map_err(|e| Error::Bind(Box::new(e)))?,
+                    )
+                }
+            };
 
             let listen_addr = socket.bind_addr();
             info!("DHT listening on {:?}", listen_addr);
@@ -1497,5 +1542,46 @@ mod tests {
         // Some platforms refuse to send a datagram this large, which is fine.
         let _ = silent.send_to(&[0u8; 20_000], dht.listen_addr()).await;
         assert_answers_ping(&dht).await;
+    }
+
+    #[tokio::test]
+    async fn test_dht_answers_ping_through_custom_socket() {
+        use librqbit_core::net::DatagramSocket;
+        use std::sync::Arc;
+
+        // Stays open, so the bootstrap query gets neither an answer nor an ICMP error.
+        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let custom = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let custom_addr = custom.local_addr().unwrap();
+        let custom: Arc<dyn DatagramSocket> = Arc::new(custom);
+
+        let dht = DhtState::with_config(DhtConfig {
+            bootstrap_addrs: Some(vec![silent.local_addr().unwrap().to_string()]),
+            socket: Some(custom),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(dht.listen_addr(), custom_addr);
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client
+            .send_to(
+                b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe",
+                custom_addr,
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let len = loop {
+            let (len, addr) = client.recv_from(&mut buf).await.unwrap();
+            if addr == custom_addr {
+                break len;
+            }
+        };
+        let response = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
+        assert!(matches!(response.kind, MessageKind::Response(_)));
+        assert_eq!(response.transaction_id.as_ref(), b"aa");
+        dht.cancellation_token().cancel();
     }
 }
