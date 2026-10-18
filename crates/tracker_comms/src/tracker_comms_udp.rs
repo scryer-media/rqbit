@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use librqbit_core::{hash_id::Id20, spawn_utils::spawn_with_cancel};
+use librqbit_core::{hash_id::Id20, net::DatagramSocket, spawn_utils::spawn_with_cancel};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use parking_lot::RwLock;
 use rand::RngExt;
@@ -242,8 +242,33 @@ struct ClientLocked {
     transactions: HashMap<TransactionId, tokio::sync::oneshot::Sender<Response>>,
 }
 
+/// The socket the UDP tracker client talks through.
+///
+/// The kernel socket is called directly; a custom transport goes through the
+/// [`DatagramSocket`] trait object.
+enum UdpTrackerSocket {
+    Udp(UdpSocket),
+    Custom(Arc<dyn DatagramSocket>),
+}
+
+impl UdpTrackerSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Udp(sock) => sock.recv_from(buf).await,
+            Self::Custom(sock) => sock.recv_from(buf).await,
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Udp(sock) => sock.send_to(buf, target).await,
+            Self::Custom(sock) => sock.send_to(buf, target).await,
+        }
+    }
+}
+
 struct ClientShared {
-    sock: UdpSocket,
+    sock: UdpTrackerSocket,
     locked: RwLock<ClientLocked>,
 }
 
@@ -279,6 +304,19 @@ impl UdpTrackerClient {
         )
         .with_context(|| format!("error creating UDP socket at {addr}"))?;
 
+        Ok(Self::spawn(cancel_token, UdpTrackerSocket::Udp(sock)))
+    }
+
+    /// Create a client that sends and receives tracker traffic through `socket`
+    /// instead of binding a kernel UDP socket.
+    pub fn new_with_socket(
+        cancel_token: CancellationToken,
+        socket: Arc<dyn DatagramSocket>,
+    ) -> Self {
+        Self::spawn(cancel_token, UdpTrackerSocket::Custom(socket))
+    }
+
+    fn spawn(cancel_token: CancellationToken, sock: UdpTrackerSocket) -> Self {
         let client = Self {
             state: Arc::new(ClientShared {
                 sock,
@@ -291,7 +329,7 @@ impl UdpTrackerClient {
             async move { client.run().await }
         });
 
-        Ok(client)
+        client
     }
 
     async fn run(self) -> anyhow::Result<()> {
@@ -419,13 +457,60 @@ impl UdpTrackerClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, str::FromStr};
+    use std::{
+        io::Write,
+        net::{Ipv4Addr, SocketAddr},
+        str::FromStr,
+        sync::Arc,
+    };
 
-    use librqbit_core::{hash_id::Id20, peer_id::generate_peer_id};
+    use librqbit_core::{hash_id::Id20, net::DatagramSocket, peer_id::generate_peer_id};
+    use tokio_util::sync::CancellationToken;
 
     use crate::tracker_comms_udp::{
-        AnnounceFields, EVENT_NONE, Request, Response, new_transaction_id,
+        ACTION_CONNECT, AnnounceFields, CONNECTION_ID_MAGIC, EVENT_NONE, Request, Response,
+        UdpTrackerClient, new_transaction_id,
     };
+
+    #[tokio::test]
+    async fn test_connect_through_custom_socket() {
+        const CONNECTION_ID: u64 = 0x1122_3344_5566_7788;
+
+        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let tracker_addr = tracker.local_addr().unwrap();
+
+        let client_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let client_sock: Arc<dyn DatagramSocket> = Arc::new(client_sock);
+
+        let token = CancellationToken::new();
+        let client = UdpTrackerClient::new_with_socket(token.clone(), client_sock);
+
+        let fake_tracker = async {
+            let mut buf = [0u8; 1024];
+            let (len, from): (usize, SocketAddr) = tracker.recv_from(&mut buf).await.unwrap();
+            assert_eq!(from, client_addr);
+            assert_eq!(len, 16);
+            assert_eq!(buf[..8], CONNECTION_ID_MAGIC.to_be_bytes());
+            assert_eq!(buf[8..12], ACTION_CONNECT.to_be_bytes());
+            let tid = &buf[12..16];
+
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+            reply.extend_from_slice(tid);
+            reply.extend_from_slice(&CONNECTION_ID.to_be_bytes());
+            tracker.send_to(&reply, from).await.unwrap();
+        };
+
+        let (connection_id, ()) =
+            tokio::join!(client.get_connection_id(tracker_addr), fake_tracker);
+        assert_eq!(connection_id.unwrap(), CONNECTION_ID);
+        token.cancel();
+    }
 
     #[test]
     fn test_parse_announce() {
