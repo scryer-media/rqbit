@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -23,6 +23,7 @@ use crate::{
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
     merge_streams::merge_streams,
+    network::SocketFactory,
     peer_connection::PeerConnectionOptions,
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
@@ -486,6 +487,20 @@ pub struct SessionOptions {
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
+
+    /// Create peer sockets with this factory instead of binding kernel
+    /// sockets. See [`SocketFactory`] for what it covers.
+    pub socket_factory: Option<Arc<dyn SocketFactory>>,
+
+    /// Use this HTTP client (HTTP trackers, torrent, blocklist and allowlist
+    /// downloads) instead of building one. When set, `ConnectionOptions::proxy_url`,
+    /// `bind_device_name` and `client_name_and_version` do not apply to HTTP
+    /// requests; configure them on the client.
+    ///
+    /// The client also does its own DNS lookups: [`SocketFactory::resolver`]
+    /// does not apply to it. If HTTP hostname lookups must be routed too, build
+    /// the client with its own resolver (`reqwest::ClientBuilder::dns_resolver`).
+    pub http_client: Option<reqwest::Client>,
 }
 
 impl Default for SessionOptions {
@@ -514,6 +529,8 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            socket_factory: None,
+            http_client: None,
         }
     }
 }
@@ -602,6 +619,7 @@ impl Session {
                             opts.root_span.as_ref().and_then(|s| s.id()),
                             token.child_token(),
                             bind_device.as_ref(),
+                            opts.socket_factory.as_ref(),
                         )
                         .await
                         .context("error starting listeners")?,
@@ -611,14 +629,28 @@ impl Session {
             };
 
             let dht = if let Some(dht_config) = opts.dht.take() {
+                // With a socket factory the DHT runs over a datagram socket the
+                // factory binds; the factory decides the real address.
+                let dht_socket = match opts.socket_factory.as_ref() {
+                    Some(factory) => Some(
+                        factory
+                            .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
+                            .await
+                            .context("error binding DHT socket through socket factory")?,
+                    ),
+                    None => None,
+                };
+                let dht_resolver = opts.socket_factory.as_ref().and_then(|f| f.resolver());
                 let dht = if let Some(persistence_config) = dht_config.persistence {
-                    PersistentDht::create(
+                    PersistentDht::create_with_socket(
                         persistence_config,
                         dht_config.port,
                         opts.ipv4_only,
                         dht_config.bootstrap_addrs,
                         Some(token.clone()),
                         bind_device.as_ref(),
+                        dht_socket,
+                        dht_resolver,
                     )
                     .await
                     .context("error initializing persistent DHT")?
@@ -629,6 +661,8 @@ impl Session {
                         cancellation_token: Some(token.child_token()),
                         bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
+                        socket: dht_socket,
+                        resolver: dht_resolver,
                         ..Default::default()
                     })
                     .await
@@ -710,7 +744,9 @@ impl Session {
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
-            let reqwest_client = {
+            let reqwest_client = if let Some(client) = opts.http_client.take() {
+                client
+            } else {
                 let builder = if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
@@ -738,6 +774,7 @@ impl Session {
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
+                    socket_factory: opts.socket_factory.clone(),
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -765,9 +802,23 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                .await
-                .context("error creating UDP tracker client")?;
+            let udp_tracker_client = match opts.socket_factory.as_ref() {
+                Some(factory) => {
+                    let addr: SocketAddr = if opts.ipv4_only {
+                        (Ipv4Addr::UNSPECIFIED, 0).into()
+                    } else {
+                        (Ipv6Addr::UNSPECIFIED, 0).into()
+                    };
+                    let socket = factory
+                        .bind_udp(addr)
+                        .await
+                        .context("error binding UDP tracker socket through socket factory")?;
+                    UdpTrackerClient::new_with_socket(token.clone(), socket, factory.resolver())
+                }
+                None => UdpTrackerClient::new(token.clone(), bind_device.as_ref())
+                    .await
+                    .context("error creating UDP tracker client")?,
+            };
 
             let lsd = {
                 if opts.disable_local_service_discovery {
@@ -823,6 +874,21 @@ impl Session {
 
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
+                    let max_pending_incoming_handshake_checks =
+                        listen.max_pending_incoming_handshake_checks;
+                    session.spawn(
+                        debug_span!(parent: session.rs(), "tcp_listen", addr = ?listen.addr),
+                        "tcp_listen",
+                        {
+                            let this = session.clone();
+                            async move {
+                                this.task_listener(tcp, max_pending_incoming_handshake_checks)
+                                    .await
+                            }
+                        },
+                    );
+                }
+                if let Some(tcp) = listen.custom_tcp_socket.take() {
                     let max_pending_incoming_handshake_checks =
                         listen.max_pending_incoming_handshake_checks;
                     session.spawn(

@@ -2,12 +2,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use librqbit_dualstack_sockets::ConnectOpts;
-use librqbit_utp::{BindDevice, UtpSocketUdp};
+use librqbit_utp::BindDevice;
 use serde::Serialize;
 use tracing::debug;
 
 use crate::{
     Error, PeerConnectionOptions, Result,
+    network::{SocketFactory, UtpSocket},
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
     vectored_traits::AsyncReadVectoredIntoCompat,
 };
@@ -62,9 +63,10 @@ pub(crate) struct SocksProxyConfig {
 pub(crate) struct StreamConnectorArgs {
     pub enable_tcp: bool,
     pub socks_proxy_config: Option<SocksProxyConfig>,
-    pub utp_socket: Option<Arc<UtpSocketUdp>>,
+    pub utp_socket: Option<UtpSocket>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
+    pub socket_factory: Option<Arc<dyn SocketFactory>>,
 }
 
 impl SocksProxyConfig {
@@ -127,14 +129,21 @@ gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
     utp PerFamilyAtomic PerFamilySnapshot
 ]);
 
+/// An outgoing TCP connection: a kernel socket, or streams from a `SocketFactory`.
+enum TcpConn {
+    Kernel(tokio::net::TcpStream),
+    Custom(BoxAsyncReadVectored, BoxAsyncWrite),
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamConnector {
     proxy_config: Option<SocksProxyConfig>,
     enable_tcp: bool,
     bind_device: Option<BindDevice>,
-    utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
+    utp_socket: Option<UtpSocket>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
+    socket_factory: Option<Arc<dyn SocketFactory>>,
 }
 
 impl StreamConnector {
@@ -160,6 +169,7 @@ impl StreamConnector {
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
+            socket_factory: config.socket_factory,
         })
     }
 
@@ -245,7 +255,20 @@ impl StreamConnector {
             if !self.enable_tcp {
                 return Ok(None);
             }
-            let conn = self.tcp_connect(addr).await?;
+            let conn = match self.socket_factory.as_ref() {
+                Some(factory) => {
+                    let (r, w) = self
+                        .with_stat(
+                            ConnectionKind::Tcp,
+                            addr.is_ipv6(),
+                            factory.connect_tcp(addr),
+                        )
+                        .await
+                        .map_err(librqbit_dualstack_sockets::Error::Connect)?;
+                    TcpConn::Custom(r, w)
+                }
+                None => TcpConn::Kernel(self.tcp_connect(addr).await?),
+            };
             debug!(?addr, "connected over TCP");
             Ok::<_, librqbit_dualstack_sockets::Error>(Some(conn))
         };
@@ -294,9 +317,12 @@ impl StreamConnector {
             tokio::select! {
                 tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
                     match tcp_res {
-                        Ok(Some(stream)) => {
+                        Ok(Some(TcpConn::Kernel(stream))) => {
                             let (r, w) = stream.into_split();
                             return Ok((ConnectionKind::Tcp, Box::new(r), Box::new(w)));
+                        },
+                        Ok(Some(TcpConn::Custom(r, w))) => {
+                            return Ok((ConnectionKind::Tcp, r, w));
                         },
                         Ok(None) => {
                             tcp_err = Some(None);
