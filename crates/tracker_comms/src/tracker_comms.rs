@@ -25,6 +25,7 @@ use crate::tracker_comms_http;
 use crate::tracker_comms_udp;
 use crate::tracker_comms_udp::UdpTrackerClient;
 use librqbit_core::hash_id::Id20;
+use librqbit_core::net::Resolver;
 
 pub struct TrackerComms {
     info_hash: Id20,
@@ -105,6 +106,7 @@ enum UdpTrackerResolveResult {
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
+    resolver: Option<&dyn Resolver>,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
     let res = match host {
         url::Host::Domain(name) => {
@@ -112,10 +114,14 @@ async fn udp_tracker_to_socket_addrs(
 
             let mut v4: Option<SocketAddrV4> = None;
             let mut v6: Option<SocketAddrV6> = None;
-            for addr in tokio::net::lookup_host((name, port))
-                .await
-                .with_context(|| format!("error looking up hostname {name}"))?
-            {
+            let addrs: Vec<SocketAddr> = match resolver {
+                Some(resolver) => resolver.resolve(name, port).await,
+                None => tokio::net::lookup_host((name, port))
+                    .await
+                    .map(Iterator::collect),
+            }
+            .with_context(|| format!("error looking up hostname {name}"))?;
+            for addr in addrs {
                 match (v4, v6, addr) {
                     (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
                     (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
@@ -341,7 +347,7 @@ impl TrackerComms {
 
             // This should retry forever until the addrs are resolved.
             let addrs = (async || {
-                udp_tracker_to_socket_addrs(host.clone(), port)
+                udp_tracker_to_socket_addrs(host.clone(), port, client.resolver())
                     .instrument(trace_span!("resolve", ?host))
                     .await
                     .or_else(|err| prev_addrs.ok_or(err))
@@ -434,5 +440,103 @@ impl TrackerComms {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use librqbit_core::net::{BoxFuture, DatagramSocket, Resolver};
+    use tokio_util::sync::CancellationToken;
+    use url::Url;
+
+    use super::{UdpTrackerResolveResult, udp_tracker_to_socket_addrs};
+    use crate::tracker_comms_udp::{ACTION_CONNECT, CONNECTION_ID_MAGIC, UdpTrackerClient};
+
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    impl Resolver for CountingResolver {
+        fn resolve<'a>(
+            &'a self,
+            host: &'a str,
+            port: u16,
+        ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            Box::pin(async move {
+                assert_eq!(host, "tracker.invalid");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![(Ipv4Addr::LOCALHOST, port).into()])
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_udp_tracker_hostname_through_custom_resolver() {
+        const CONNECTION_ID: u64 = 0x1122_3344_5566_7788;
+
+        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let tracker_addr = tracker.local_addr().unwrap();
+
+        let client_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let client_sock: Arc<dyn DatagramSocket> = Arc::new(client_sock);
+
+        let resolver = Arc::new(CountingResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let token = CancellationToken::new();
+        let client =
+            UdpTrackerClient::new_with_socket(token.clone(), client_sock, Some(resolver.clone()));
+
+        let url = Url::parse(&format!(
+            "udp://tracker.invalid:{}/announce",
+            tracker_addr.port()
+        ))
+        .unwrap();
+        let resolved = udp_tracker_to_socket_addrs(
+            url.host().unwrap(),
+            url.port().unwrap(),
+            client.resolver(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        let addr = match resolved {
+            UdpTrackerResolveResult::One(addr) => addr,
+            other => panic!("expected one address, got {other:?}"),
+        };
+        assert_eq!(addr, tracker_addr);
+
+        let fake_tracker = async {
+            let mut buf = [0u8; 1024];
+            let (len, from): (usize, SocketAddr) = tracker.recv_from(&mut buf).await.unwrap();
+            assert_eq!(from, client_addr);
+            assert_eq!(len, 16);
+            assert_eq!(buf[..8], CONNECTION_ID_MAGIC.to_be_bytes());
+            assert_eq!(buf[8..12], ACTION_CONNECT.to_be_bytes());
+            let tid = &buf[12..16];
+
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+            reply.extend_from_slice(tid);
+            reply.extend_from_slice(&CONNECTION_ID.to_be_bytes());
+            tracker.send_to(&reply, from).await.unwrap();
+        };
+
+        let (connection_id, ()) = tokio::join!(client.get_connection_id(addr), fake_tracker);
+        assert_eq!(connection_id.unwrap(), CONNECTION_ID);
+        token.cancel();
     }
 }

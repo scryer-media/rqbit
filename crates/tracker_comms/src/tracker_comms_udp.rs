@@ -7,14 +7,18 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use librqbit_core::{hash_id::Id20, net::DatagramSocket, spawn_utils::spawn_with_cancel};
+use librqbit_core::{
+    hash_id::Id20,
+    net::{DatagramSocket, Resolver},
+    spawn_utils::spawn_with_cancel,
+};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use parking_lot::RwLock;
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, debug_span, trace, warn};
 
-const ACTION_CONNECT: u32 = 0;
+pub(crate) const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
 // const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
@@ -25,7 +29,7 @@ pub const EVENT_STARTED: u32 = 2;
 pub const EVENT_STOPPED: u32 = 3;
 
 pub type ConnectionId = u64;
-const CONNECTION_ID_MAGIC: ConnectionId = 0x41727101980;
+pub(crate) const CONNECTION_ID_MAGIC: ConnectionId = 0x41727101980;
 
 pub type TransactionId = u32;
 
@@ -269,6 +273,7 @@ impl UdpTrackerSocket {
 
 struct ClientShared {
     sock: UdpTrackerSocket,
+    resolver: Option<Arc<dyn Resolver>>,
     locked: RwLock<ClientLocked>,
 }
 
@@ -304,22 +309,31 @@ impl UdpTrackerClient {
         )
         .with_context(|| format!("error creating UDP socket at {addr}"))?;
 
-        Ok(Self::spawn(cancel_token, UdpTrackerSocket::Udp(sock)))
+        Ok(Self::spawn(cancel_token, UdpTrackerSocket::Udp(sock), None))
     }
 
     /// Create a client that sends and receives tracker traffic through `socket`
     /// instead of binding a kernel UDP socket.
+    ///
+    /// When `resolver` is set, UDP tracker hostnames are looked up through it
+    /// instead of the host's resolver.
     pub fn new_with_socket(
         cancel_token: CancellationToken,
         socket: Arc<dyn DatagramSocket>,
+        resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
-        Self::spawn(cancel_token, UdpTrackerSocket::Custom(socket))
+        Self::spawn(cancel_token, UdpTrackerSocket::Custom(socket), resolver)
     }
 
-    fn spawn(cancel_token: CancellationToken, sock: UdpTrackerSocket) -> Self {
+    fn spawn(
+        cancel_token: CancellationToken,
+        sock: UdpTrackerSocket,
+        resolver: Option<Arc<dyn Resolver>>,
+    ) -> Self {
         let client = Self {
             state: Arc::new(ClientShared {
                 sock,
+                resolver,
                 locked: RwLock::new(Default::default()),
             }),
         };
@@ -330,6 +344,11 @@ impl UdpTrackerClient {
         });
 
         client
+    }
+
+    /// The resolver for tracker hostnames, if one was injected.
+    pub(crate) fn resolver(&self) -> Option<&dyn Resolver> {
+        self.state.resolver.as_deref()
     }
 
     async fn run(self) -> anyhow::Result<()> {
@@ -368,7 +387,7 @@ impl UdpTrackerClient {
         }
     }
 
-    async fn get_connection_id(&self, addr: SocketAddr) -> anyhow::Result<ConnectionId> {
+    pub(crate) async fn get_connection_id(&self, addr: SocketAddr) -> anyhow::Result<ConnectionId> {
         if let Some(m) = self.state.locked.read().connections.get(&addr)
             && m.created.elapsed() < Duration::from_secs(60)
         {
@@ -488,7 +507,7 @@ mod tests {
         let client_sock: Arc<dyn DatagramSocket> = Arc::new(client_sock);
 
         let token = CancellationToken::new();
-        let client = UdpTrackerClient::new_with_socket(token.clone(), client_sock);
+        let client = UdpTrackerClient::new_with_socket(token.clone(), client_sock, None);
 
         let fake_tracker = async {
             let mut buf = [0u8; 1024];
