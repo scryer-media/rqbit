@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
+use librqbit_core::lengths::Lengths;
 
 use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
@@ -34,6 +35,33 @@ pub struct TorrentStateInitializing {
     pause_requested: AtomicBool,
     check_running: AtomicBool,
     previously_errored: bool,
+    // Pieces the embedder says are present and verified: when set, they are
+    // the have set and no piece is read back to check it.
+    initial_have: Option<BF>,
+}
+
+/// Bring a caller-supplied have-bitfield to the torrent's BEP 3 bitfield
+/// layout: one bit per piece, rounded up to whole bytes, spare bits clear.
+///
+/// It accepts exactly the piece count in bits, or the byte-rounded length with
+/// its spare bits clear, as a peer's BITFIELD message must be (BEP 3).
+pub(crate) fn normalize_initial_have(have: BF, lengths: &Lengths) -> anyhow::Result<BF> {
+    let pieces = lengths.total_pieces() as usize;
+    let bytes = lengths.piece_bitfield_bytes();
+    let bits = have.len();
+    if bits != pieces && bits != bytes * 8 {
+        anyhow::bail!(
+            "initial_have has {bits} bits, but the torrent has {pieces} pieces: expected {pieces} bits, or {bytes} bytes with the spare bits clear"
+        );
+    }
+    if have[pieces..].any() {
+        anyhow::bail!(
+            "initial_have marks pieces past the last one ({pieces} pieces): the spare bits must be clear"
+        );
+    }
+    let mut normalized = BF::from_boxed_slice(vec![0u8; bytes].into_boxed_slice());
+    normalized[..pieces].copy_from_bitslice(&have[..pieces]);
+    Ok(normalized)
 }
 
 impl TorrentStateInitializing {
@@ -43,6 +71,7 @@ impl TorrentStateInitializing {
         only_files: Option<Vec<usize>>,
         files: FileStorage,
         previously_errored: bool,
+        initial_have: Option<BF>,
     ) -> Self {
         Self {
             shared,
@@ -53,6 +82,7 @@ impl TorrentStateInitializing {
             pause_requested: AtomicBool::new(false),
             check_running: AtomicBool::new(false),
             previously_errored,
+            initial_have,
         }
     }
 
@@ -186,15 +216,12 @@ impl TorrentStateInitializing {
         Some(hp)
     }
 
-    pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
-        let id: TorrentIdOrHash = self.shared.info_hash.into();
-        let bitv_factory = self
-            .shared
-            .session
-            .upgrade()
-            .context("session is dead")?
-            .bitv_factory
-            .clone();
+    // The have set from fastresume data when it holds up, else from hashing every piece.
+    async fn resume_or_check(
+        &self,
+        bitv_factory: &dyn BitVFactory,
+        id: TorrentIdOrHash,
+    ) -> anyhow::Result<Box<dyn BitV>> {
         let have_pieces = if self.previously_errored {
             if let Err(e) = bitv_factory.clear(id).await {
                 warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, error=?e, "error clearing bitfield");
@@ -207,25 +234,49 @@ impl TorrentStateInitializing {
                 .context("error loading have_pieces")?
         };
 
-        let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;
+        if let Some(h) = self.validate_fastresume(bitv_factory, have_pieces).await {
+            return Ok(h);
+        }
 
-        let have_pieces = match have_pieces {
-            Some(h) => h,
-            None => {
-                info!("Doing initial checksum validation, this might take a while...");
-                let have_pieces = self
-                    .shared
-                    .spawner
-                    .block_in_place_with_semaphore(|| {
-                        FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos)
-                            .initial_check(&self.checked_bytes, &self.pause_requested)
-                    })
-                    .await?;
+        info!("Doing initial checksum validation, this might take a while...");
+        let have_pieces = self
+            .shared
+            .spawner
+            .block_in_place_with_semaphore(|| {
+                FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos)
+                    .initial_check(&self.checked_bytes, &self.pause_requested)
+            })
+            .await?;
+        bitv_factory
+            .store_initial_check(id, have_pieces)
+            .await
+            .context("error storing initial check bitfield")
+    }
+
+    pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
+        let id: TorrentIdOrHash = self.shared.info_hash.into();
+        let bitv_factory = self
+            .shared
+            .session
+            .upgrade()
+            .context("session is dead")?
+            .bitv_factory
+            .clone();
+
+        let have_pieces = match self.initial_have.as_ref() {
+            Some(have) => {
+                // The embedder vouches for these pieces, so none is read back. Storing
+                // them makes them the fastresume state too, replacing whatever was there.
+                info!(
+                    torrent=?self.shared.id,
+                    "using the supplied have-bitfield, skipping the initial check"
+                );
                 bitv_factory
-                    .store_initial_check(id, have_pieces)
+                    .store_initial_check(id, have.clone())
                     .await
-                    .context("error storing initial check bitfield")?
+                    .context("error storing the supplied have-bitfield")?
             }
+            None => self.resume_or_check(&*bitv_factory, id).await?,
         };
 
         let selected_pieces = compute_selected_pieces(
@@ -300,5 +351,53 @@ impl TorrentStateInitializing {
             streams: Arc::new(Default::default()),
         };
         Ok(paused)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use librqbit_core::lengths::Lengths;
+
+    use super::normalize_initial_have;
+    use crate::type_aliases::BF;
+
+    fn bf(bits: &[bool]) -> BF {
+        bits.iter()
+            .copied()
+            .collect::<bitvec::vec::BitVec<u8, bitvec::order::Msb0>>()
+            .into_boxed_bitslice()
+    }
+
+    #[test]
+    fn test_normalize_initial_have() {
+        // 10 pieces: two bytes on the wire, six spare bits.
+        let l = Lengths::new(10 * 1024, 1024).unwrap();
+        let mut ten = [false; 10];
+        ten[0] = true;
+        ten[9] = true;
+
+        // Exactly the piece count, padded to whole bytes.
+        let n = normalize_initial_have(bf(&ten), &l).unwrap();
+        assert_eq!(n.len(), 16);
+        assert_eq!(n.as_raw_slice(), &[0b1000_0000, 0b0100_0000]);
+
+        // Whole bytes with the spare bits clear, as a BITFIELD message carries it.
+        let wire = BF::from_boxed_slice(vec![0b1000_0000, 0b0100_0000].into_boxed_slice());
+        assert_eq!(
+            normalize_initial_have(wire, &l).unwrap().as_raw_slice(),
+            &[0b1000_0000, 0b0100_0000]
+        );
+
+        // A spare bit set names a piece that does not exist.
+        let spare = BF::from_boxed_slice(vec![0, 0b0010_0000].into_boxed_slice());
+        assert!(normalize_initial_have(spare, &l).is_err());
+
+        // Any other length.
+        for bits in [0usize, 9, 11, 15, 24] {
+            assert!(
+                normalize_initial_have(bf(&vec![false; bits]), &l).is_err(),
+                "{bits} bits"
+            );
+        }
     }
 }

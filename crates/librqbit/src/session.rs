@@ -37,9 +37,10 @@ use crate::{
     },
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
+        TorrentMetadata, TorrentStateLive,
+        initializing::{TorrentStateInitializing, normalize_initial_have},
     },
-    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
+    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -300,6 +301,18 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// The pieces the storage already holds and that the caller has already
+    /// verified, as a BEP 3 bitfield: bit 0 (the high bit of the first byte)
+    /// is piece 0. When set, the initial hash check does not run: these pieces
+    /// are taken as have and every other piece as missing, and none of them is
+    /// read back from the storage. It also takes precedence over any fastresume
+    /// bitfield.
+    ///
+    /// Its length is either the piece count, or the piece count rounded up to
+    /// whole bytes with the spare bits clear; anything else is refused.
+    #[serde(skip)]
+    pub initial_have: Option<BF>,
 }
 
 pub struct ListOnlyResponse {
@@ -1447,6 +1460,12 @@ impl Session {
             opts.list_only,
         )?;
 
+        let initial_have = opts
+            .initial_have
+            .take()
+            .map(|have| normalize_initial_have(have, metadata.info.lengths()))
+            .transpose()?;
+
         let output_folder = match (opts.output_folder, opts.sub_folder) {
             (None, None) => self.output_folder.join(
                 self.get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
@@ -1538,6 +1557,7 @@ impl Session {
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
+                initial_have,
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {

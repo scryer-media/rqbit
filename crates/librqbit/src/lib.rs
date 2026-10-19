@@ -102,7 +102,7 @@ pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState,
 };
-pub use type_aliases::FileInfos;
+pub use type_aliases::{BF, FileInfos};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
