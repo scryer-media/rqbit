@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use librqbit_core::directories::get_configuration_directory;
-use librqbit_core::net::DatagramSocket;
+use librqbit_core::net::{DatagramSocket, Resolver};
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use librqbit_dualstack_sockets::BindDevice;
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,7 @@ impl PersistentDht {
             cancellation_token,
             bind_device,
             None,
+            None,
         )
     }
 
@@ -126,7 +127,11 @@ impl PersistentDht {
     /// and receives through it instead of binding a kernel UDP socket. In that
     /// case `port`, `ipv4_only`, `bind_device` and any persisted port are
     /// ignored.
+    ///
+    /// When `resolver` is set, bootstrap hostnames are looked up through it
+    /// instead of the host's resolver.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_socket<'a>(
         persistence_config: DhtPersistenceConfig,
         port: Option<u16>,
@@ -135,6 +140,7 @@ impl PersistentDht {
         cancellation_token: Option<CancellationToken>,
         bind_device: Option<&'a BindDevice>,
         socket: Option<Arc<dyn DatagramSocket>>,
+        resolver: Option<Arc<dyn Resolver>>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {
             let config_filename = match persistence_config.config_filename {
@@ -196,6 +202,7 @@ impl PersistentDht {
                 cancellation_token,
                 bind_device,
                 socket,
+                resolver,
                 ..Default::default()
             };
             let dht = DhtState::with_config(dht_config).await?;

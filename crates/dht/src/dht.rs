@@ -31,7 +31,7 @@ use librqbit_core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     crate_version,
     hash_id::Id20,
-    net::DatagramSocket,
+    net::{DatagramSocket, Resolver},
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
 };
@@ -999,6 +999,7 @@ impl DhtSocket {
 
 struct DhtWorker {
     socket: DhtSocket,
+    resolver: Option<Arc<dyn Resolver>>,
     dht: Arc<DhtState>,
 }
 
@@ -1027,11 +1028,28 @@ impl DhtWorker {
         };
     }
 
+    /// Resolve a bootstrap `host:port` (or `ip:port`) string.
+    async fn lookup_bootstrap(&self, hostname: &str) -> std::io::Result<Vec<SocketAddr>> {
+        let Some(resolver) = self.resolver.as_ref() else {
+            return Ok(tokio::net::lookup_host(hostname).await?.collect());
+        };
+        if let Ok(addr) = hostname.parse::<SocketAddr>() {
+            return Ok(vec![addr]);
+        }
+        let (host, port) = hostname
+            .rsplit_once(':')
+            .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid socket address")
+            })?;
+        resolver.resolve(host, port).await
+    }
+
     async fn bootstrap_hostname(&self, hostname: &str) -> crate::Result<()> {
-        let addrs = tokio::net::lookup_host(hostname)
+        let addrs = self
+            .lookup_bootstrap(hostname)
             .await
-            .map_err(|err| Error::lookup(hostname, err))?
-            .collect::<Vec<_>>();
+            .map_err(|err| Error::lookup(hostname, err))?;
         let v4 = RecursiveRequest::find_node_for_routing_table(
             self.dht.clone(),
             self.dht.id,
@@ -1344,6 +1362,9 @@ pub struct DhtConfig<'a> {
     /// ignored and the DHT reports the socket's `bind_addr()` as its listen
     /// address.
     pub socket: Option<Arc<dyn DatagramSocket>>,
+    /// Look up bootstrap hostnames through this resolver instead of the host's
+    /// resolver.
+    pub resolver: Option<Arc<dyn Resolver>>,
 }
 
 impl DhtState {
@@ -1407,8 +1428,13 @@ impl DhtState {
                 state.cancellation_token.clone(),
                 {
                     let state = state.clone();
+                    let resolver = config.resolver.take();
                     async move {
-                        let worker = DhtWorker { socket, dht: state };
+                        let worker = DhtWorker {
+                            socket,
+                            resolver,
+                            dht: state,
+                        };
                         worker.start(in_rx, &bootstrap_addrs).await
                     }
                 },
@@ -1582,6 +1608,64 @@ mod tests {
         let response = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
         assert!(matches!(response.kind, MessageKind::Response(_)));
         assert_eq!(response.transaction_id.as_ref(), b"aa");
+        dht.cancellation_token().cancel();
+    }
+
+    #[tokio::test]
+    async fn test_dht_bootstrap_lookup_through_custom_resolver() {
+        use librqbit_core::net::{BoxFuture, Resolver};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CountingResolver {
+            target: SocketAddr,
+            calls: AtomicUsize,
+        }
+
+        impl Resolver for CountingResolver {
+            fn resolve<'a>(
+                &'a self,
+                host: &'a str,
+                port: u16,
+            ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+                Box::pin(async move {
+                    assert_eq!(host, "bootstrap.invalid");
+                    assert_eq!(port, self.target.port());
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![self.target])
+                })
+            }
+        }
+
+        let bootstrap = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let bootstrap_addr = bootstrap.local_addr().unwrap();
+        let resolver = Arc::new(CountingResolver {
+            target: bootstrap_addr,
+            calls: AtomicUsize::new(0),
+        });
+
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec![format!("bootstrap.invalid:{}", bootstrap_addr.port())]),
+            resolver: Some(resolver.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // The only way the DHT learns this address is through the resolver.
+        let mut buf = [0u8; 1024];
+        let len = loop {
+            let (len, addr) = bootstrap.recv_from(&mut buf).await.unwrap();
+            if addr == dht.listen_addr() {
+                break len;
+            }
+        };
+        let request = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
+        assert!(matches!(request.kind, MessageKind::FindNodeRequest(_)));
+        assert!(resolver.calls.load(Ordering::SeqCst) >= 1);
         dht.cancellation_token().cancel();
     }
 }
