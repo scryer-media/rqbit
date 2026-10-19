@@ -4,6 +4,7 @@ use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use backon::BackoffBuilder;
@@ -42,6 +43,7 @@ pub struct TrackerComms {
     key: u32,
     // Per tier, the tracker that accepted `started` and so is owed `stopped`.
     started: Mutex<Vec<Option<SupportedTracker>>>,
+    status: TrackerStatus,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +109,12 @@ enum SupportedTracker {
 }
 
 impl SupportedTracker {
+    fn url(&self) -> &Url {
+        match self {
+            SupportedTracker::Udp(u) | SupportedTracker::Http(u) => u,
+        }
+    }
+
     fn new(url: Url) -> Option<Self> {
         match url.scheme() {
             "http" | "https" => Some(SupportedTracker::Http(url)),
@@ -234,6 +242,142 @@ struct Announced {
     peers: Vec<SocketAddr>,
     interval: Duration,
     min_interval: Option<Duration>,
+    seeders: Option<u32>,
+    leechers: Option<u32>,
+}
+
+/// What a tracker answered to an announce it accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnnounceOk {
+    pub interval: Duration,
+    pub min_interval: Option<Duration>,
+    /// Peers with the whole torrent, as the tracker counts them.
+    pub seeders: Option<u32>,
+    /// Peers still downloading, as the tracker counts them.
+    pub leechers: Option<u32>,
+}
+
+/// The outcome of the most recent regular announce to a tracker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastAnnounce {
+    /// When the announce finished.
+    pub at: SystemTime,
+    pub result: Result<AnnounceOk, String>,
+}
+
+/// One tracker of a torrent and how announcing to it is going.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackerAnnounce {
+    /// The announce URL.
+    pub url: String,
+    /// A regular announce to this tracker is waiting for its answer.
+    pub in_flight: bool,
+    /// None until the tracker has been announced to.
+    pub last: Option<LastAnnounce>,
+}
+
+/// The announce table of one [`TrackerComms`]: one entry per tracker it was
+/// started with, in the order given, from the start. Clones share the table,
+/// which stays readable after the tracker task ends.
+#[derive(Clone)]
+pub struct TrackerStatus(Arc<tokio::sync::watch::Sender<Vec<TrackerAnnounce>>>);
+
+impl std::fmt::Debug for TrackerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TrackerStatus")
+            .field(&*self.0.borrow())
+            .finish()
+    }
+}
+
+impl TrackerStatus {
+    fn new<'a>(urls: impl IntoIterator<Item = &'a Url>) -> Self {
+        let mut announces: Vec<TrackerAnnounce> = Vec::new();
+        for url in urls {
+            let url = url.to_string();
+            if announces.iter().all(|a| a.url != url) {
+                announces.push(TrackerAnnounce {
+                    url,
+                    in_flight: false,
+                    last: None,
+                });
+            }
+        }
+        Self(Arc::new(tokio::sync::watch::channel(announces).0))
+    }
+
+    /// A snapshot of the table.
+    pub fn announces(&self) -> Vec<TrackerAnnounce> {
+        self.0.borrow().clone()
+    }
+
+    /// Sees every change to the table.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Vec<TrackerAnnounce>> {
+        self.0.subscribe()
+    }
+
+    /// Marks an announce to `tracker` as sent; the returned guard records how
+    /// it ended.
+    fn begin(&self, tracker: &SupportedTracker) -> InFlight<'_> {
+        let url = tracker.url().to_string();
+        self.0.send_modify(|announces| {
+            if let Some(a) = announces.iter_mut().find(|a| a.url == url) {
+                a.in_flight = true;
+            }
+        });
+        InFlight {
+            status: self,
+            url,
+            last: None,
+        }
+    }
+}
+
+/// An announce waiting for its answer. Dropping it ends the announce in the
+/// table: with the outcome given to [`InFlight::finish`], or with none when
+/// the announce was abandoned (the tracker task was dropped).
+struct InFlight<'a> {
+    status: &'a TrackerStatus,
+    url: String,
+    last: Option<LastAnnounce>,
+}
+
+impl InFlight<'_> {
+    fn finish(mut self, result: &anyhow::Result<Announced>) {
+        self.last = Some(LastAnnounce {
+            at: SystemTime::now(),
+            result: match result {
+                Ok(a) => Ok(AnnounceOk {
+                    interval: a.interval,
+                    min_interval: a.min_interval,
+                    seeders: a.seeders,
+                    leechers: a.leechers,
+                }),
+                Err(e) => Err(format!("{e:#}")),
+            },
+        });
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let last = self.last.take();
+        self.status.0.send_modify(|announces| {
+            if let Some(a) = announces.iter_mut().find(|a| a.url == self.url) {
+                a.in_flight = false;
+                if last.is_some() {
+                    a.last = last;
+                }
+            }
+        });
+    }
+}
+
+/// A started tracker task: the peers it finds, and its announce table.
+pub struct TrackerTask {
+    /// Dropping it ends the task and sends `stopped`.
+    pub peers: BoxStream<'static, SocketAddr>,
+    pub status: TrackerStatus,
 }
 
 /// Bounds the `stopped` announce (BEP 3) a tracker task sends when its peer
@@ -392,6 +536,10 @@ async fn udp_tracker_to_socket_addrs(
     Ok(res)
 }
 
+fn saturating_u32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 fn backoff() -> backon::ExponentialBackoff {
     ExponentialBuilder::new()
         .without_max_times()
@@ -417,7 +565,7 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
-    ) -> Option<BoxStream<'static, SocketAddr>> {
+    ) -> Option<TrackerTask> {
         Self::start_with_tiers(
             info_hash,
             peer_id,
@@ -438,7 +586,8 @@ impl TrackerComms {
     /// Each tracker is sent `started`, then `completed` once if the torrent
     /// finishes during this run (see [`TrackerCommsStats::finished_during_run`]),
     /// and `stopped` when the returned stream is dropped. `stopped` is bounded
-    /// and tracked by `stopped`.
+    /// and tracked by `stopped`. Each regular announce is recorded in the
+    /// returned [`TrackerStatus`].
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_tiers(
         info_hash: Id20,
@@ -450,7 +599,7 @@ impl TrackerComms {
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
-    ) -> Option<BoxStream<'static, SocketAddr>> {
+    ) -> Option<TrackerTask> {
         let tiers = tiers
             .into_iter()
             .filter_map(|urls| {
@@ -472,6 +621,12 @@ impl TrackerComms {
 
         tracing::trace!(?tiers);
 
+        let status = TrackerStatus::new(
+            tiers
+                .iter()
+                .flat_map(|tier| tier.trackers.iter().map(SupportedTracker::url)),
+        );
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
 
         let comms = Arc::new(Self {
@@ -485,6 +640,7 @@ impl TrackerComms {
             udp_client,
             key: rand::random(),
             started: Mutex::new(vec![None; tiers.len()]),
+            status: status.clone(),
         });
         let stop_on_drop = StopOnDrop {
             comms: comms.clone(),
@@ -516,7 +672,10 @@ impl TrackerComms {
             }
         };
 
-        Some(s.boxed())
+        Some(TrackerTask {
+            peers: s.boxed(),
+            status,
+        })
     }
 
     async fn task_tier(&self, idx: usize, mut tier: Tier) -> anyhow::Result<()> {
@@ -526,7 +685,10 @@ impl TrackerComms {
             let stats = self.stats.get();
             let event = state.next_event(&stats);
             let tracker = tier.current().clone();
-            match self.announce(&tracker, event, &stats).await {
+            let in_flight = self.status.begin(&tracker);
+            let result = self.announce(&tracker, event, &stats).await;
+            in_flight.finish(&result);
+            match result {
                 Ok(announced) => {
                     tier.on_success();
                     retry = None;
@@ -652,6 +814,8 @@ impl TrackerComms {
             peers: response.iter_peers().collect(),
             interval: Duration::from_secs(response.interval),
             min_interval: response.min_interval.map(Duration::from_secs),
+            seeders: response.complete.map(saturating_u32),
+            leechers: response.incomplete.map(saturating_u32),
         })
     }
 
@@ -721,6 +885,8 @@ impl TrackerComms {
                     // UDP trackers (BEP 15) send only an interval.
                     interval: Duration::from_secs(response.interval.max(5) as u64),
                     min_interval: None,
+                    seeders: Some(response.seeders),
+                    leechers: Some(response.leechers),
                 })
             }
             Err(e) => {
@@ -752,9 +918,9 @@ mod tests {
     use url::Url;
 
     use super::{
-        AnnounceState, ReannounceDelay, StoppedAnnounces, SupportedTracker, Tier, TrackerComms,
-        TrackerCommsStats, TrackerCommsStatsState, UdpTrackerResolveResult,
-        udp_tracker_to_socket_addrs,
+        AnnounceOk, AnnounceState, ReannounceDelay, StoppedAnnounces, SupportedTracker, Tier,
+        TrackerAnnounce, TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerTask,
+        UdpTrackerResolveResult, udp_tracker_to_socket_addrs,
     };
     use crate::tracker_comms_http::TrackerRequestEvent;
     use crate::tracker_comms_udp::{ACTION_CONNECT, CONNECTION_ID_MAGIC, UdpTrackerClient};
@@ -931,6 +1097,13 @@ mod tests {
 
     /// The query string of the next HTTP request, answered with an empty peer list.
     async fn next_announce(listener: &tokio::net::TcpListener) -> String {
+        let (conn, query) = read_announce(listener).await;
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        query
+    }
+
+    /// The next HTTP request, unanswered, and its query string.
+    async fn read_announce(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
         let (conn, _) = listener.accept().await.unwrap();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -945,7 +1118,11 @@ mod tests {
         }
         let request = String::from_utf8(buf).unwrap();
         let path = request.split(' ').nth(1).unwrap().to_owned();
-        let body = "d8:intervali1800e5:peers0:e";
+        (conn, path.split_once('?').unwrap().1.to_owned())
+    }
+
+    /// Answers an HTTP request with `body`.
+    async fn respond(conn: tokio::net::TcpStream, body: &str) {
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -959,7 +1136,6 @@ mod tests {
                 Err(e) => panic!("{e}"),
             }
         }
-        path.split_once('?').unwrap().1.to_owned()
     }
 
     fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -1000,7 +1176,8 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .peers;
 
         // Drive the peer stream while waiting for the tracker to be called.
         macro_rules! announce {
@@ -1060,9 +1237,161 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .peers;
         drop(peers);
         // Never polled, so no tracker heard `started` and none is owed `stopped`.
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    async fn http_listener() -> (tokio::net::TcpListener, Url) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/announce",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        (listener, url)
+    }
+
+    async fn start(
+        tiers: Vec<Vec<Url>>,
+        stopped: &StoppedAnnounces,
+    ) -> (TrackerTask, CancellationToken) {
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let task = TrackerComms::start_with_tiers(
+            Id20::new([1; 20]),
+            Id20::new([2; 20]),
+            tiers,
+            Box::new(()),
+            None,
+            6881,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap();
+        (task, token)
+    }
+
+    fn announce_of<'a>(announces: &'a [TrackerAnnounce], url: &Url) -> &'a TrackerAnnounce {
+        announces
+            .iter()
+            .find(|a| a.url == url.as_str())
+            .unwrap_or_else(|| panic!("{url} is not in the table"))
+    }
+
+    #[tokio::test]
+    async fn test_announce_table_records_in_flight_success_and_error() {
+        let (ok, ok_url) = http_listener().await;
+        let (err, err_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) =
+            start(vec![vec![ok_url.clone()], vec![err_url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+
+        // Every tracker is listed before any announce goes out.
+        let never = |url: &Url| TrackerAnnounce {
+            url: url.to_string(),
+            in_flight: false,
+            last: None,
+        };
+        assert_eq!(status.announces(), vec![never(&ok_url), never(&err_url)]);
+
+        // Drive the peer stream while the trackers are called.
+        macro_rules! driving {
+            ($f:expr) => {
+                tokio::select! {
+                    _ = peers.next() => panic!("the tracker sent no peers"),
+                    r = $f => r,
+                }
+            };
+        }
+
+        let ((ok_conn, _), (err_conn, _)) =
+            driving!(async { tokio::join!(read_announce(&ok), read_announce(&err)) });
+        let announces = status.announces();
+        for url in [&ok_url, &err_url] {
+            let a = announce_of(&announces, url);
+            assert!(a.in_flight, "{url} should be in flight");
+            assert_eq!(a.last, None);
+        }
+
+        respond(
+            ok_conn,
+            "d8:completei3e10:incompletei5e8:intervali1800e12:min intervali900e5:peers0:e",
+        )
+        .await;
+        respond(err_conn, "d14:failure reason4:nopee").await;
+        let mut rx = status.subscribe();
+        driving!(
+            rx.wait_for(|announces| announces.iter().all(|a| !a.in_flight && a.last.is_some()))
+        )
+        .unwrap();
+
+        let announces = status.announces();
+        assert_eq!(
+            announce_of(&announces, &ok_url)
+                .last
+                .as_ref()
+                .unwrap()
+                .result,
+            Ok(AnnounceOk {
+                interval: Duration::from_secs(1800),
+                min_interval: Some(Duration::from_secs(900)),
+                seeders: Some(3),
+                leechers: Some(5),
+            })
+        );
+        let error = announce_of(&announces, &err_url)
+            .last
+            .as_ref()
+            .unwrap()
+            .result
+            .clone()
+            .unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+
+        // The table outlives the task: the outcomes stay readable.
+        drop(peers);
+        let q = next_announce(&ok).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        assert_eq!(status.announces(), announces);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_announce_abandoned_in_flight_leaves_no_outcome() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+
+        let _conn = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = read_announce(&listener) => r,
+        };
+        assert!(status.announces()[0].in_flight);
+
+        // Dropping the stream drops the task mid-announce.
+        drop(peers);
+        assert_eq!(
+            status.announces(),
+            vec![TrackerAnnounce {
+                url: url.to_string(),
+                in_flight: false,
+                last: None,
+            }]
+        );
+        // `started` was never accepted, so no `stopped` is owed.
         stopped.wait_idle().await;
         token.cancel();
     }

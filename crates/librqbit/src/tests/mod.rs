@@ -7,5 +7,6 @@ mod e2e_piece_priority;
 mod e2e_ratelimits;
 mod e2e_socket_factory;
 mod e2e_stream;
+mod e2e_tracker_announces;
 mod embedder_util;
 pub mod test_util;

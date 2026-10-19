@@ -119,9 +119,7 @@ impl Request {
 #[derive(Debug)]
 pub struct AnnounceResponse {
     pub interval: u32,
-    #[allow(dead_code)]
     pub leechers: u32,
-    #[allow(dead_code)]
     pub seeders: u32,
     pub addrs: Vec<SocketAddr>,
 }
@@ -579,6 +577,28 @@ mod tests {
         let b = include_bytes!("../resources/test/udp-tracker-announce-response.bin");
         let (tid, response) = Response::parse(b, false).unwrap();
         dbg!(tid, response);
+    }
+
+    #[test]
+    fn test_parse_announce_counts() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&super::ACTION_ANNOUNCE.to_be_bytes());
+        b.extend_from_slice(&7u32.to_be_bytes()); // transaction id
+        b.extend_from_slice(&1800u32.to_be_bytes()); // interval
+        b.extend_from_slice(&5u32.to_be_bytes()); // leechers
+        b.extend_from_slice(&3u32.to_be_bytes()); // seeders
+        b.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
+        let (tid, response) = Response::parse(&b, false).unwrap();
+        assert_eq!(tid, 7);
+        match response {
+            Response::Announce(r) => {
+                assert_eq!(r.interval, 1800);
+                assert_eq!(r.leechers, 5);
+                assert_eq!(r.seeders, 3);
+                assert_eq!(r.addrs, vec!["127.0.0.1:6881".parse().unwrap()]);
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
     }
 
     #[ignore]

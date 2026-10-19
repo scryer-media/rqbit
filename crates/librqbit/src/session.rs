@@ -41,7 +41,7 @@ use crate::{
         TorrentMetadata, TorrentStateLive,
         initializing::{TorrentStateInitializing, normalize_initial_have},
     },
-    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
+    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerStream},
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -1485,11 +1485,11 @@ impl Session {
                 None => {
                     // Whether the torrent is private is known only once its
                     // metadata arrives.
-                    let peer_rx = make_peer_rx(false).context(
+                    let PeerSource { peers, trackers } = make_peer_rx(false).context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &tracker_tiers, opts.peer_opts)
+                        .resolve_magnet(info_hash, peers, &tracker_tiers, opts.peer_opts)
                         .await?;
 
                     seen_peers = resolved_magnet.seen_peers.clone();
@@ -1502,13 +1502,14 @@ impl Session {
                     } else {
                         // Add back seen_peers into the peer stream, as we consumed some peers
                         // while resolving the magnet.
-                        Some(
-                            merge_streams(
+                        Some(PeerSource {
+                            peers: merge_streams(
                                 resolved_magnet.peer_rx,
                                 futures::stream::iter(resolved_magnet.seen_peers),
                             )
                             .boxed(),
-                        )
+                            trackers,
+                        })
                     };
                     (resolved_magnet.metadata, peer_rx)
                 }
@@ -1642,6 +1643,7 @@ impl Session {
                     state: ManagedTorrentState::Initializing(initializing),
                     only_files,
                     piece_priorities,
+                    trackers: None,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,
@@ -1778,6 +1780,15 @@ impl Session {
         t: &Arc<ManagedTorrent>,
         announce: bool,
     ) -> Option<PeerStream> {
+        self.peer_source_managed_torrent(t, announce)
+            .map(|s| s.peers)
+    }
+
+    fn peer_source_managed_torrent(
+        self: &Arc<Self>,
+        t: &ManagedTorrentHandle,
+        announce: bool,
+    ) -> Option<PeerSource> {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
@@ -1811,7 +1822,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
-    ) -> Option<PeerStream> {
+    ) -> Option<PeerSource> {
         let dht_rx = if is_private {
             None
         } else {
@@ -1833,7 +1844,7 @@ impl Session {
             session: self.clone(),
             torrent: Default::default(),
         };
-        let tracker_rx = TrackerComms::start_with_tiers(
+        let (tracker_rx, trackers) = TrackerComms::start_with_tiers(
             info_hash,
             self.peer_id,
             self.announce_tiers(tracker_tiers, is_private),
@@ -1843,7 +1854,9 @@ impl Session {
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
-        );
+        )
+        .map(|task| (task.peers, task.status))
+        .unzip();
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -1857,6 +1870,7 @@ impl Session {
             ),
             lsd_rx,
         )
+        .map(|peers| PeerSource { peers, trackers })
     }
 
     async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
@@ -1874,7 +1888,7 @@ impl Session {
     }
 
     pub async fn unpause(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
-        let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
+        let peer_rx = self.peer_source_managed_torrent(handle, true);
         handle.start(peer_rx, false)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())

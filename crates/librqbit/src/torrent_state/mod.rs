@@ -48,6 +48,7 @@ use crate::storage::BoxStorageFactory;
 use crate::stream_connect::StreamConnector;
 use crate::torrent_state::stats::LiveStats;
 use crate::type_aliases::FileInfos;
+use crate::type_aliases::PeerSource;
 use crate::type_aliases::PeerStream;
 
 use initializing::TorrentStateInitializing;
@@ -108,6 +109,9 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) only_files: Option<Vec<usize>>,
     // The fetch priority of every piece; None while all are Normal.
     pub(crate) piece_priorities: Option<Vec<PiecePriority>>,
+    // The announce table of the trackers of the latest live run. It outlives
+    // the run, so the last outcomes stay readable while paused.
+    pub(crate) trackers: Option<tracker_comms::TrackerStatus>,
 }
 
 #[derive(Default)]
@@ -415,12 +419,12 @@ impl ManagedTorrent {
     /// start_paused: if set, the torrent will initialize (check file integrity), but will not start
     pub(crate) fn start(
         self: &Arc<Self>,
-        peer_rx: Option<PeerStream>,
+        peer_rx: Option<PeerSource>,
         start_paused: bool,
     ) -> anyhow::Result<()> {
         fn _start<'a>(
             t: &'a Arc<ManagedTorrent>,
-            peer_rx: Option<PeerStream>,
+            peer_rx: Option<PeerSource>,
             start_paused: bool,
             session: Arc<Session>,
             g: Option<parking_lot::RwLockWriteGuard<'a, ManagedTorrentLocked>>,
@@ -502,7 +506,8 @@ impl ManagedTorrent {
 
                     spawn_fatal_errors_receiver(t, rx, token);
                     if let Some(peer_rx) = peer_rx {
-                        spawn_peer_adder(&live, peer_rx);
+                        spawn_peer_adder(&live, peer_rx.peers);
+                        g.trackers = peer_rx.trackers;
                     }
                     Ok(())
                 }
@@ -551,6 +556,22 @@ impl ManagedTorrent {
 
     pub fn is_paused(&self) -> bool {
         self.locked.read().paused
+    }
+
+    /// Every tracker of the latest live run and how announcing to it went.
+    /// Empty when the torrent has not run with trackers yet. While paused, the
+    /// last outcomes stay readable and nothing is in flight.
+    pub fn tracker_announces(&self) -> Vec<tracker_comms::TrackerAnnounce> {
+        self.tracker_status()
+            .map(|t| t.announces())
+            .unwrap_or_default()
+    }
+
+    /// The announce table behind [`Self::tracker_announces`], to wait for
+    /// changes with [`tracker_comms::TrackerStatus::subscribe`]. A new live run
+    /// brings a new table.
+    pub fn tracker_status(&self) -> Option<tracker_comms::TrackerStatus> {
+        self.locked.read().trackers.clone()
     }
 
     /// Pause the torrent if it's live.
