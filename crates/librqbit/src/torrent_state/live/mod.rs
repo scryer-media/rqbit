@@ -112,7 +112,7 @@ use self::{
 };
 
 use super::{
-    ManagedTorrentShared, TorrentMetadata,
+    ManagedTorrentShared, RunCounters, TorrentMetadata,
     paused::TorrentStatePaused,
     streaming::TorrentStreams,
     utils::{TimedExistence, timeit},
@@ -199,6 +199,8 @@ pub struct TorrentStateLive {
 
     finished_notify: Notify,
     new_pieces_notify: Notify,
+    // Whether every wanted piece was already present when this run began.
+    finished_at_start: bool,
 
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
@@ -241,6 +243,7 @@ impl TorrentStateLive {
         let up_speed_estimator = SpeedEstimator::default();
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
+        let finished_at_start = paused.chunk_tracker.get_hns().finished();
         let lengths = *paused.chunk_tracker.get_lengths();
 
         // TODO: make it configurable
@@ -292,6 +295,7 @@ impl TorrentStateLive {
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
+            finished_at_start,
             down_speed_estimator,
             up_speed_estimator,
             cancellation_token,
@@ -787,6 +791,13 @@ impl TorrentStateLive {
         // into_chunks() will requeue any in-flight pieces
         let chunk_tracker = piece_tracker.into_chunks();
 
+        let hns = chunk_tracker.get_hns();
+        *self.shared.last_run.lock() = Some(RunCounters {
+            uploaded_bytes: self.get_uploaded_bytes(),
+            progress_bytes: hns.progress(),
+            total_bytes: hns.total(),
+        });
+
         Ok(TorrentStatePaused {
             shared: self.shared.clone(),
             metadata: self.metadata.clone(),
@@ -826,6 +837,12 @@ impl TorrentStateLive {
     // If we have all selected pieces but not necessarily all pieces.
     pub(crate) fn is_finished(&self) -> bool {
         self.get_hns().map(|h| h.finished()).unwrap_or_default()
+    }
+
+    /// Whether the torrent was missing wanted pieces when this run began and
+    /// has all of them now.
+    pub(crate) fn finished_during_run(&self) -> bool {
+        !self.finished_at_start && self.is_finished()
     }
 
     fn has_active_streams_unfinished_files(&self, state: &TorrentStateLocked) -> bool {

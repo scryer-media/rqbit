@@ -18,6 +18,8 @@ use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, debug_span, trace, warn};
 
+use crate::tracker_comms_http::TrackerRequestEvent;
+
 pub(crate) const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
 // const ACTION_SCRAPE: u32 = 2;
@@ -27,6 +29,16 @@ pub const EVENT_NONE: u32 = 0;
 pub const EVENT_COMPLETED: u32 = 1;
 pub const EVENT_STARTED: u32 = 2;
 pub const EVENT_STOPPED: u32 = 3;
+
+/// The `event` field of a UDP announce (BEP 15).
+pub(crate) fn udp_event(event: Option<TrackerRequestEvent>) -> u32 {
+    match event {
+        None => EVENT_NONE,
+        Some(TrackerRequestEvent::Completed) => EVENT_COMPLETED,
+        Some(TrackerRequestEvent::Started) => EVENT_STARTED,
+        Some(TrackerRequestEvent::Stopped) => EVENT_STOPPED,
+    }
+}
 
 pub type ConnectionId = u64;
 pub(crate) const CONNECTION_ID_MAGIC: ConnectionId = 0x41727101980;
@@ -529,6 +541,37 @@ mod tests {
             tokio::join!(client.get_connection_id(tracker_addr), fake_tracker);
         assert_eq!(connection_id.unwrap(), CONNECTION_ID);
         token.cancel();
+    }
+
+    #[test]
+    fn test_announce_request_carries_the_event() {
+        use crate::tracker_comms_http::TrackerRequestEvent as E;
+        for (event, wire) in [
+            (None, 0u32),
+            (Some(E::Completed), 1),
+            (Some(E::Started), 2),
+            (Some(E::Stopped), 3),
+        ] {
+            let request = Request::Announce(
+                1,
+                AnnounceFields {
+                    info_hash: Id20::new([1; 20]),
+                    peer_id: Id20::new([2; 20]),
+                    downloaded: 0,
+                    left: 0,
+                    uploaded: 0,
+                    event: super::udp_event(event),
+                    key: 0,
+                    port: 6881,
+                },
+            );
+            let mut buf = [0u8; 128];
+            let len = request.serialize(0, &mut buf).unwrap();
+            assert_eq!(len, 98);
+            // connection id, action, transaction id, info hash, peer id,
+            // downloaded, left, uploaded, then the event (BEP 15).
+            assert_eq!(buf[80..84], wire.to_be_bytes());
+        }
     }
 
     #[test]

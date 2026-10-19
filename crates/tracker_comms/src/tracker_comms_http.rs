@@ -13,12 +13,11 @@ use librqbit_core::{
     hash_id::Id20,
 };
 
-#[derive(Clone, Copy)]
+/// The `event` of an announce (BEP 3). A regular re-announce carries none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackerRequestEvent {
     Started,
-    #[allow(dead_code)]
     Stopped,
-    #[allow(dead_code)]
     Completed,
 }
 

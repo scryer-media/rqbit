@@ -183,7 +183,10 @@ pub struct ManagedTorrentShared {
     pub id: TorrentId,
     pub info_hash: Id20,
     pub(crate) spawner: BlockingSpawner,
+    /// Every tracker in `tracker_tiers`.
     pub trackers: HashSet<url::Url>,
+    /// The torrent's trackers grouped into tiers (BEP 12), in announce order.
+    pub tracker_tiers: Vec<Vec<url::Url>>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -195,6 +198,18 @@ pub struct ManagedTorrentShared {
     pub(crate) magnet_name: Option<String>,
 
     pub(crate) client_name_and_version: String,
+
+    /// Counters of the most recent live run, recorded as the run ends, so a
+    /// `stopped` tracker announce made after it ended reports them.
+    pub(crate) last_run: parking_lot::Mutex<Option<RunCounters>>,
+}
+
+/// Transfer counters of one live run of a torrent.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RunCounters {
+    pub uploaded_bytes: u64,
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
 }
 
 impl ManagedTorrentShared {
