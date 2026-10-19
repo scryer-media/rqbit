@@ -142,6 +142,33 @@ impl PersistentDht {
         socket: Option<Arc<dyn DatagramSocket>>,
         resolver: Option<Arc<dyn Resolver>>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
+        Self::create_from_config(
+            persistence_config,
+            port,
+            ipv4_only,
+            DhtConfig {
+                bootstrap_addrs,
+                cancellation_token,
+                bind_device,
+                socket,
+                resolver,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Like [`PersistentDht::create_with_socket`], with the rest of the DHT's
+    /// settings taken from `config`. The persisted state supplies `peer_id`, the
+    /// routing tables, `peer_store` and the listen address, so those fields of
+    /// `config` are ignored; `port` and `ipv4_only` choose the listen address as
+    /// in [`PersistentDht::create`].
+    #[inline(never)]
+    pub fn create_from_config<'a>(
+        persistence_config: DhtPersistenceConfig,
+        port: Option<u16>,
+        ipv4_only: bool,
+        config: DhtConfig<'a>,
+    ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {
             let config_filename = match persistence_config.config_filename {
                 Some(f) => f,
@@ -195,15 +222,11 @@ impl PersistentDht {
 
             let dht_config = DhtConfig {
                 peer_id,
-                bootstrap_addrs,
                 routing_table,
+                routing_table_v6: None,
                 listen_addr: Some(listen_addr),
                 peer_store,
-                cancellation_token,
-                bind_device,
-                socket,
-                resolver,
-                ..Default::default()
+                ..config
             };
             let dht = DhtState::with_config(dht_config).await?;
             spawn_with_cancel::<anyhow::Error>(

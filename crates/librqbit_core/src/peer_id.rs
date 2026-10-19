@@ -77,8 +77,8 @@ fn version_digit_to_id(d: u8) -> Option<u8> {
 fn version_digit_from_id(d: u8) -> Option<u8> {
     match d {
         b'0'..=b'9' => Some(d - b'0'),
-        b'A'..=b'Z' => Some(d - b'0' - 10),
-        b'a'..=b'z' => Some(d - b'0' - 10 - 26),
+        b'A'..=b'Z' => Some(d - b'A' + 10),
+        b'a'..=b'z' => Some(d - b'a' + 36),
         b'.' => Some(62),
         b'-' => Some(63),
         _ => None,
@@ -123,6 +123,21 @@ mod tests {
             assert_ne!(id1, id2);
             assert_eq!(id1.0[..8], id2.0[..8]);
             assert_eq!(id1.0[..8], correct_fingerprint);
+        }
+    }
+
+    // Each version digit decodes to the value it was encoded from.
+    #[test]
+    fn test_azureus_version_digits_round_trip() {
+        use super::{version_digit_from_id, version_digit_to_id};
+        for d in 0..64u8 {
+            let c = version_digit_to_id(d).unwrap();
+            assert_eq!(
+                version_digit_from_id(c),
+                Some(d),
+                "digit {d} as {:?}",
+                c as char
+            );
         }
     }
 }

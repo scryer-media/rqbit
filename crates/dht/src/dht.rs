@@ -591,9 +591,13 @@ pub struct DhtState {
     cancellation_token: CancellationToken,
 
     pub(crate) peer_store: PeerStore,
+
+    // BEP 5 "v": sent with every outgoing message when set.
+    client_version: Option<ByteBufOwned>,
 }
 
 impl DhtState {
+    #[allow(clippy::too_many_arguments)]
     fn new_internal(
         id: Id20,
         sender: UnboundedSender<WorkerSendRequest>,
@@ -602,6 +606,7 @@ impl DhtState {
         listen_addr: SocketAddr,
         peer_store: PeerStore,
         cancellation_token: CancellationToken,
+        client_version: Option<ByteBufOwned>,
     ) -> Self {
         let routing_table_v4 = routing_table_v4.unwrap_or_else(|| RoutingTable::new(id, None));
         let routing_table_v6 = routing_table_v6.unwrap_or_else(|| RoutingTable::new(id, None));
@@ -616,6 +621,7 @@ impl DhtState {
             rate_limiter: make_rate_limiter(),
             peer_store,
             cancellation_token,
+            client_version,
         }
     }
 
@@ -1233,7 +1239,7 @@ impl DhtWorker {
                 bprotocol::serialize_message(
                     &mut buf,
                     message.transaction_id,
-                    message.version,
+                    message.version.or_else(|| self.dht.client_version.clone()),
                     message.ip,
                     message.kind,
                 )
@@ -1365,6 +1371,28 @@ pub struct DhtConfig<'a> {
     /// Look up bootstrap hostnames through this resolver instead of the host's
     /// resolver.
     pub resolver: Option<Arc<dyn Resolver>>,
+    /// The leading bytes of our node id, the rest being random (BEP 5 node ids
+    /// are otherwise random). A client puts its BEP 20 peer id fingerprint here
+    /// so that one identity covers the peer wire, trackers and the DHT. An
+    /// explicit or restored `peer_id` is kept only if it starts with these bytes;
+    /// otherwise a new id is made, and the routing tables and peer store, which
+    /// are built around the old one, are dropped. At most 20 bytes are used.
+    /// Defaults to rqbit's own fingerprint.
+    pub node_id_prefix: Option<Vec<u8>>,
+    /// The BEP 5 client version ("v"): by convention the two BEP 20 client
+    /// letters followed by two version bytes. Sent with every outgoing message
+    /// when set; when not, no "v" is sent.
+    pub client_version: Option<Vec<u8>>,
+}
+
+// A node id starting with `prefix` (at most 20 bytes of it), the rest random.
+fn generate_node_id(prefix: &[u8]) -> Id20 {
+    use rand::Rng as _;
+    let mut id = [0u8; 20];
+    let len = prefix.len().min(20);
+    id[..len].copy_from_slice(&prefix[..len]);
+    rand::rng().fill_bytes(&mut id[len..]);
+    Id20::new(id)
 }
 
 impl DhtState {
@@ -1401,10 +1429,24 @@ impl DhtState {
             let listen_addr = socket.bind_addr();
             info!("DHT listening on {:?}", listen_addr);
 
-            let peer_id = config
-                .peer_id
-                .unwrap_or_else(|| generate_azereus_style(*b"rQ", crate_version!()));
+            let peer_id = match config.node_id_prefix.as_deref() {
+                None => config
+                    .peer_id
+                    .unwrap_or_else(|| generate_azereus_style(*b"rQ", crate_version!())),
+                Some(prefix) => {
+                    let prefix = &prefix[..prefix.len().min(20)];
+                    config
+                        .peer_id
+                        .filter(|id| id.0.starts_with(prefix))
+                        .unwrap_or_else(|| generate_node_id(prefix))
+                }
+            };
             info!("starting up DHT with peer id {:?}", peer_id);
+            // A routing table is laid out by distance from its own node's id, and the
+            // peer store hands out tokens for it: neither carries over to another id.
+            let routing_table = config.routing_table.filter(|t| t.id() == peer_id);
+            let routing_table_v6 = config.routing_table_v6.filter(|t| t.id() == peer_id);
+            let peer_store = config.peer_store.filter(|s| s.self_id == peer_id);
             let bootstrap_addrs = config
                 .bootstrap_addrs
                 .unwrap_or_else(|| crate::DHT_BOOTSTRAP.iter().map(|v| v.to_string()).collect());
@@ -1415,11 +1457,12 @@ impl DhtState {
             let state = Arc::new(Self::new_internal(
                 peer_id,
                 in_tx,
-                config.routing_table,
-                config.routing_table_v6,
+                routing_table,
+                routing_table_v6,
                 listen_addr,
-                config.peer_store.unwrap_or_else(|| PeerStore::new(peer_id)),
+                peer_store.unwrap_or_else(|| PeerStore::new(peer_id)),
                 token,
+                config.client_version.map(ByteBufOwned::from),
             ));
 
             spawn_with_cancel(
@@ -1667,5 +1710,152 @@ mod tests {
         assert!(matches!(request.kind, MessageKind::FindNodeRequest(_)));
         assert!(resolver.calls.load(Ordering::SeqCst) >= 1);
         dht.cancellation_token().cancel();
+    }
+
+    // Start a DHT on loopback whose one bootstrap node is `bootstrap`, a socket the
+    // test holds: whatever the DHT sends lands there and nowhere else.
+    async fn start_dht_with(bootstrap: &UdpSocket, config: DhtConfig<'static>) -> Dht {
+        DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(vec![bootstrap.local_addr().unwrap().to_string()]),
+            ..config
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn recv_message_from(
+        sock: &UdpSocket,
+        from: SocketAddr,
+    ) -> bprotocol::Message<ByteBufOwned> {
+        let mut buf = [0u8; 2048];
+        loop {
+            let (len, addr) = sock.recv_from(&mut buf).await.unwrap();
+            if addr == from {
+                return bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
+            }
+        }
+    }
+
+    // The "v" on the DHT's own bootstrap query and on its answer to our ping.
+    async fn versions_sent(client_version: Option<Vec<u8>>) -> [Option<Vec<u8>>; 2] {
+        let bootstrap = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dht = start_dht_with(
+            &bootstrap,
+            DhtConfig {
+                client_version,
+                ..Default::default()
+            },
+        )
+        .await;
+        let query = recv_message_from(&bootstrap, dht.listen_addr()).await;
+
+        bootstrap
+            .send_to(
+                b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe",
+                dht.listen_addr(),
+            )
+            .await
+            .unwrap();
+        let answer = loop {
+            let m = recv_message_from(&bootstrap, dht.listen_addr()).await;
+            if m.transaction_id.as_ref() == b"aa" {
+                break m;
+            }
+        };
+        assert!(matches!(answer.kind, MessageKind::Response(_)));
+        dht.cancellation_token().cancel();
+        [query, answer].map(|m| m.version.map(|v| v.as_ref().to_vec()))
+    }
+
+    #[tokio::test]
+    async fn test_client_version_is_sent_only_when_configured() {
+        assert_eq!(versions_sent(None).await, [None, None]);
+        let v = b"XY\x01\x02".to_vec();
+        assert_eq!(
+            versions_sent(Some(v.clone())).await,
+            [Some(v.clone()), Some(v)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_node_id_prefix() {
+        use crate::routing_table::RoutingTable;
+        use librqbit_core::hash_id::Id20;
+
+        let bootstrap = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+        // By default: rqbit's own fingerprint.
+        let dht = start_dht_with(&bootstrap, DhtConfig::default()).await;
+        assert!(dht.stats().id.0.starts_with(b"-rQ"));
+        dht.cancellation_token().cancel();
+
+        // A prefix replaces it.
+        let prefix = b"-XY1234-".to_vec();
+        let dht = start_dht_with(
+            &bootstrap,
+            DhtConfig {
+                node_id_prefix: Some(prefix.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(dht.stats().id.0.starts_with(&prefix));
+        dht.cancellation_token().cancel();
+
+        // A restored id that already carries the prefix is kept, with its table.
+        let mut kept = [7u8; 20];
+        kept[..8].copy_from_slice(&prefix);
+        let kept = Id20::new(kept);
+        let dht = start_dht_with(
+            &bootstrap,
+            DhtConfig {
+                peer_id: Some(kept),
+                routing_table: Some(RoutingTable::new(kept, None)),
+                node_id_prefix: Some(prefix.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(dht.stats().id, kept);
+        dht.cancellation_token().cancel();
+
+        // One made under another identity is replaced, and so is the table built
+        // around it.
+        let other = Id20::new([9u8; 20]);
+        let dht = start_dht_with(
+            &bootstrap,
+            DhtConfig {
+                peer_id: Some(other),
+                routing_table: Some(RoutingTable::new(other, None)),
+                node_id_prefix: Some(prefix.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let id = dht.stats().id;
+        assert!(id.0.starts_with(&prefix));
+        dht.with_routing_tables(|v4, v6| {
+            assert_eq!(v4.id(), id);
+            assert_eq!(v6.id(), id);
+        });
+        dht.cancellation_token().cancel();
+
+        // An empty prefix: an entirely random id, not rqbit's fingerprint.
+        let ids: Vec<Id20> = futures::future::join_all((0..4).map(|_| async {
+            let dht = start_dht_with(
+                &bootstrap,
+                DhtConfig {
+                    node_id_prefix: Some(Vec::new()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let id = dht.stats().id;
+            dht.cancellation_token().cancel();
+            id
+        }))
+        .await;
+        assert!(ids.iter().any(|id| !id.0.starts_with(b"-rQ")));
     }
 }

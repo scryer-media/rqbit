@@ -28,7 +28,7 @@ struct StoredPeer {
 }
 
 pub struct PeerStore {
-    self_id: Id20,
+    pub(crate) self_id: Id20,
     max_remembered_tokens: u32,
     max_remembered_peers: u32,
     max_distance: Id20,
