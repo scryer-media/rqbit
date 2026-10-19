@@ -9,8 +9,18 @@ use tracing::{debug, trace};
 use crate::{
     bitv::{BitV, BoxBitV},
     file_info::FileInfo,
+    piece_priority::PiecePriority,
     type_aliases::{BF, BS, FileInfos, FilePriorities},
 };
+
+struct PieceSelection {
+    // The pieces of the selected files, whatever their priority.
+    files_selected: BF,
+
+    // The fetch priority of each piece, and how many pieces are at each level.
+    priorities: Vec<PiecePriority>,
+    priority_counts: [u32; PiecePriority::COUNT],
+}
 
 pub struct ChunkTracker {
     // This forms the basis of a "queue" to pull from.
@@ -30,9 +40,14 @@ pub struct ChunkTracker {
     // These are the pieces that we actually have, fully checked and downloaded.
     have: BoxBitV,
 
-    // The pieces that the user selected. This doesn't change unless update_only_files
-    // was called.
+    // The pieces that are wanted: those of the selected files, less the ones whose
+    // priority is Skip. This doesn't change unless update_only_files or
+    // set_piece_priorities was called.
     selected: BF,
+
+    // What the wanted pieces are derived from. Boxed: it is read only when the
+    // queue is walked or the selection changes.
+    selection: Box<PieceSelection>,
 
     // How many bytes do we have per each file.
     per_file_bytes: Vec<u64>,
@@ -169,10 +184,18 @@ impl ChunkTracker {
         // TODO: ideally this needs to be a list based on needed files, e.g.
         // last needed piece for each file. But let's keep simple for now.
 
+        let total_pieces = lengths.total_pieces();
+        let mut priority_counts = [0; PiecePriority::COUNT];
+        priority_counts[PiecePriority::Normal as usize] = total_pieces;
         let mut ct = Self {
             chunk_status: compute_chunk_have_status(&lengths, have_pieces.as_slice())
                 .context("error computing chunk status")?,
             queue_pieces: needed_pieces,
+            selection: Box::new(PieceSelection {
+                files_selected: selected_pieces.clone(),
+                priorities: vec![PiecePriority::Normal; total_pieces as usize],
+                priority_counts,
+            }),
             selected: selected_pieces,
             lengths,
             have: have_pieces,
@@ -233,7 +256,24 @@ impl ChunkTracker {
         hns
     }
 
+    // The queued pieces in the order to fetch them: by priority level, highest first,
+    // and within a level by file priority. A level no piece is at costs nothing, so
+    // with every piece at Normal this is a single pass in file order.
     pub(crate) fn iter_queued_pieces<'a>(
+        &'a self,
+        file_priorities: &'a FilePriorities,
+        file_infos: &'a FileInfos,
+    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
+        PiecePriority::WANTED_DESCENDING
+            .into_iter()
+            .filter(|level| self.selection.priority_counts[*level as usize] > 0)
+            .flat_map(move |level| {
+                self.iter_queued_pieces_in_file_order(file_priorities, file_infos)
+                    .filter(move |id| self.selection.priorities[id.get_usize()] == level)
+            })
+    }
+
+    fn iter_queued_pieces_in_file_order<'a>(
         &'a self,
         file_priorities: &'a FilePriorities,
         file_infos: &'a FileInfos,
@@ -330,11 +370,45 @@ impl ChunkTracker {
         file_infos: &FileInfos,
         new_only_files: &HashSet<usize>,
     ) -> anyhow::Result<HaveNeededSelected> {
-        let selected = compute_selected_pieces(
+        self.selection.files_selected = compute_selected_pieces(
             &self.lengths,
             |idx| new_only_files.contains(&idx),
             file_infos,
         );
+        Ok(self.apply_selection())
+    }
+
+    /// Set the fetch priority of the given pieces. Moving a piece to or from Skip
+    /// changes what is wanted, as deselecting or selecting a file does.
+    pub fn set_piece_priorities(
+        &mut self,
+        priorities: impl IntoIterator<Item = (ValidPieceIndex, PiecePriority)>,
+    ) -> HaveNeededSelected {
+        let mut wanted_changed = false;
+        for (index, priority) in priorities {
+            let sel = &mut *self.selection;
+            let prev = std::mem::replace(&mut sel.priorities[index.get_usize()], priority);
+            sel.priority_counts[prev as usize] -= 1;
+            sel.priority_counts[priority as usize] += 1;
+            wanted_changed |= (prev == PiecePriority::Skip) != (priority == PiecePriority::Skip);
+        }
+        if wanted_changed {
+            self.apply_selection();
+        }
+        self.hns
+    }
+
+    // Recompute what is wanted (the selected files' pieces less the skipped ones),
+    // and bring the queue in line with it.
+    fn apply_selection(&mut self) -> HaveNeededSelected {
+        let mut selected = self.selection.files_selected.clone();
+        if self.selection.priority_counts[PiecePriority::Skip as usize] > 0 {
+            for (idx, p) in self.selection.priorities.iter().enumerate() {
+                if *p == PiecePriority::Skip {
+                    selected.set(idx, false);
+                }
+            }
+        }
         let prev_selected = std::mem::replace(&mut self.selected, selected);
 
         // prev_selected=false and selected=true and have=false: requeue the piece
@@ -368,7 +442,7 @@ impl ChunkTracker {
         }
 
         self.hns = self.calc_hns();
-        Ok(self.hns)
+        self.hns
     }
 
     pub(crate) fn get_selected_pieces(&self) -> &BF {
@@ -712,5 +786,63 @@ mod tests {
             !ct.queue_pieces[0],
             "a piece we have is still queued, so a second peer will download it again"
         );
+    }
+
+    // only_files and Skip both narrow what is wanted: a piece is wanted if a selected
+    // file needs it and it is not skipped, however the two were reached.
+    #[test]
+    fn test_only_files_and_skip_compose() {
+        use crate::piece_priority::PiecePriority;
+
+        let piece_len = CHUNK_SIZE;
+        let l = Lengths::new(piece_len as u64 * 4, piece_len).unwrap();
+        // File 0 is pieces 0..=1 and half of 2; file 1 is the other half of 2, and 3.
+        let half = piece_len as u64 / 2;
+        let files = vec![
+            FileInfo {
+                relative_filename: "0".into(),
+                offset_in_torrent: 0,
+                piece_range: 0..3,
+                len: piece_len as u64 * 2 + half,
+                attrs: Default::default(),
+            },
+            FileInfo {
+                relative_filename: "1".into(),
+                offset_in_torrent: piece_len as u64 * 2 + half,
+                piece_range: 2..4,
+                len: piece_len as u64 + half,
+                attrs: Default::default(),
+            },
+        ];
+        let bf_len = l.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        selected.get_mut(0..4).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.into_dyn(), selected, l, &files).unwrap();
+        let p = |i| l.validate_piece_index(i).unwrap();
+        let wanted = |ct: &ChunkTracker| -> Vec<usize> { ct.selected.iter_ones().collect() };
+
+        // Deselecting file 1 keeps piece 2, which file 0 still needs.
+        ct.update_only_files(&files, &HashSet::from_iter([0]))
+            .unwrap();
+        assert_eq!(wanted(&ct), vec![0, 1, 2]);
+
+        // A priority does not bring back a piece only a deselected file needs.
+        ct.set_piece_priorities([(p(3), PiecePriority::High)]);
+        assert_eq!(wanted(&ct), vec![0, 1, 2]);
+        assert!(!ct.queue_pieces[3]);
+
+        // Skip removes a piece a selected file needs.
+        ct.set_piece_priorities([(p(1), PiecePriority::Skip)]);
+        assert_eq!(wanted(&ct), vec![0, 2]);
+        assert!(!ct.queue_pieces[1]);
+
+        // Changing the file selection keeps the skip, and the raised piece now counts.
+        ct.update_only_files(&files, &HashSet::from_iter([0, 1]))
+            .unwrap();
+        assert_eq!(wanted(&ct), vec![0, 2, 3]);
+        assert!(ct.queue_pieces[3]);
+        assert!(!ct.queue_pieces[1]);
+        assert_eq!(ct.get_hns().needed_bytes, piece_len as u64 * 3);
     }
 }

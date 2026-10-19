@@ -91,6 +91,7 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
+    piece_priority::PiecePriority,
     piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
@@ -828,6 +829,22 @@ impl TorrentStateLive {
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
+        if !hns.finished() {
+            self.reconnect_all_not_needed_peers();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_piece_priorities(
+        &self,
+        priorities: impl IntoIterator<Item = (ValidPieceIndex, PiecePriority)>,
+    ) -> anyhow::Result<()> {
+        let hns = self
+            .lock_write("set_piece_priorities")
+            .get_pieces_mut()?
+            .set_piece_priorities(priorities);
+        // Wanting a skipped piece again may make peers we let go useful. With the
+        // state lock released, for the reason given in update_only_files().
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }

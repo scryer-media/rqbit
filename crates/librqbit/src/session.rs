@@ -25,6 +25,7 @@ use crate::{
     merge_streams::merge_streams,
     network::SocketFactory,
     peer_connection::PeerConnectionOptions,
+    piece_priority::{PiecePriority, validate_piece_priorities},
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
     session_stats::SessionStats,
@@ -313,6 +314,11 @@ pub struct AddTorrentOptions {
     /// whole bytes with the spare bits clear; anything else is refused.
     #[serde(skip)]
     pub initial_have: Option<BF>,
+
+    /// The initial fetch priority of the given pieces, by piece index; every
+    /// other piece is Normal. See [`PiecePriority`] and
+    /// [`ManagedTorrent::set_piece_priorities`]. An index out of range is refused.
+    pub piece_priorities: Option<Vec<(u32, PiecePriority)>>,
 }
 
 pub struct ListOnlyResponse {
@@ -1466,6 +1472,18 @@ impl Session {
             .map(|have| normalize_initial_have(have, metadata.info.lengths()))
             .transpose()?;
 
+        let piece_priorities = match opts.piece_priorities.take() {
+            Some(priorities) => {
+                let lengths = metadata.info.lengths();
+                let mut all = vec![PiecePriority::Normal; lengths.total_pieces() as usize];
+                for (index, priority) in validate_piece_priorities(lengths, &priorities)? {
+                    all[index.get_usize()] = priority;
+                }
+                Some(all)
+            }
+            None => None,
+        };
+
         let output_folder = match (opts.output_folder, opts.sub_folder) {
             (None, None) => self.output_folder.join(
                 self.get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
@@ -1558,12 +1576,14 @@ impl Session {
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
                 initial_have,
+                piece_priorities.clone(),
             ));
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
                     only_files,
+                    piece_priorities,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,

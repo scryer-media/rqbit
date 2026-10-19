@@ -41,6 +41,7 @@ use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
 use crate::limits::LimitsConfig;
+use crate::piece_priority::{PiecePriority, validate_piece_priorities};
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
@@ -105,6 +106,8 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) paused: bool,
     pub(crate) state: ManagedTorrentState,
     pub(crate) only_files: Option<Vec<usize>>,
+    // The fetch priority of every piece; None while all are Normal.
+    pub(crate) piece_priorities: Option<Vec<PiecePriority>>,
 }
 
 #[derive(Default)]
@@ -271,6 +274,51 @@ impl ManagedTorrent {
 
     pub fn with_state<R>(&self, f: impl FnOnce(&ManagedTorrentState) -> R) -> R {
         f(&self.locked.read().state)
+    }
+
+    /// The fetch priority of a piece, or None if the index is out of range or
+    /// the torrent is not resolved yet.
+    pub fn piece_priority(&self, piece: u32) -> Option<PiecePriority> {
+        let metadata = self.metadata.load();
+        metadata.as_ref()?.lengths().validate_piece_index(piece)?;
+        Some(
+            self.locked
+                .read()
+                .piece_priorities
+                .as_ref()
+                .map(|p| p[piece as usize])
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Set the fetch priority of the given pieces; see [`PiecePriority`]. Pieces not
+    /// named keep theirs. Refused, with nothing changed, if any index is out of range,
+    /// or while the initial check runs.
+    pub fn set_piece_priorities(&self, priorities: &[(u32, PiecePriority)]) -> anyhow::Result<()> {
+        let metadata = self.metadata.load();
+        let metadata = metadata.as_ref().context("torrent is not resolved")?;
+        let priorities = validate_piece_priorities(metadata.lengths(), priorities)?;
+
+        let mut g = self.locked.write();
+        match &mut g.state {
+            ManagedTorrentState::Initializing(_) => bail!("can't update initializing torrent"),
+            ManagedTorrentState::Error(_) => {}
+            ManagedTorrentState::None => {}
+            ManagedTorrentState::Paused(p) => {
+                p.set_piece_priorities(priorities.iter().copied());
+            }
+            ManagedTorrentState::Live(l) => {
+                l.set_piece_priorities(priorities.iter().copied())?;
+            }
+        };
+
+        let all = g.piece_priorities.get_or_insert_with(|| {
+            vec![PiecePriority::Normal; metadata.lengths().total_pieces() as usize]
+        });
+        for (index, priority) in priorities {
+            all[index.get_usize()] = priority;
+        }
+        Ok(())
     }
 
     pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut ManagedTorrentState) -> R) -> R {
@@ -455,6 +503,7 @@ impl ManagedTorrent {
                         true,
                         // After an error the data is no longer vouched for: check it.
                         None,
+                        g.piece_priorities.clone(),
                     ));
                     g.state = ManagedTorrentState::Initializing(initializing.clone());
                     t.state_change_notify.notify_waiters();

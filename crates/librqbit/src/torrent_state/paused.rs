@@ -1,7 +1,10 @@
 use std::{collections::HashSet, sync::Arc};
 
+use librqbit_core::lengths::ValidPieceIndex;
+
 use crate::{
     chunk_tracker::{ChunkTracker, HaveNeededSelected},
+    piece_priority::PiecePriority,
     type_aliases::FileStorage,
 };
 
@@ -20,6 +23,13 @@ impl TorrentStatePaused {
         self.chunk_tracker
             .update_only_files(&self.metadata.file_infos, only_files)?;
         Ok(())
+    }
+
+    pub(crate) fn set_piece_priorities(
+        &mut self,
+        priorities: impl IntoIterator<Item = (ValidPieceIndex, PiecePriority)>,
+    ) {
+        self.chunk_tracker.set_piece_priorities(priorities);
     }
 
     pub(crate) fn hns(&self) -> &HaveNeededSelected {

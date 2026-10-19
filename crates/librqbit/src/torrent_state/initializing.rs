@@ -19,6 +19,7 @@ use crate::{
     bitv_factory::BitVFactory,
     chunk_tracker::{ChunkTracker, compute_selected_pieces},
     file_ops::FileOps,
+    piece_priority::PiecePriority,
     type_aliases::{BF, FileStorage},
 };
 
@@ -38,6 +39,8 @@ pub struct TorrentStateInitializing {
     // Pieces the embedder says are present and verified: when set, they are
     // the have set and no piece is read back to check it.
     initial_have: Option<BF>,
+    // The fetch priority of every piece; None while all are Normal.
+    piece_priorities: Option<Vec<PiecePriority>>,
 }
 
 /// Bring a caller-supplied have-bitfield to the torrent's BEP 3 bitfield
@@ -72,6 +75,7 @@ impl TorrentStateInitializing {
         files: FileStorage,
         previously_errored: bool,
         initial_have: Option<BF>,
+        piece_priorities: Option<Vec<PiecePriority>>,
     ) -> Self {
         Self {
             shared,
@@ -83,6 +87,7 @@ impl TorrentStateInitializing {
             check_running: AtomicBool::new(false),
             previously_errored,
             initial_have,
+            piece_priorities,
         }
     }
 
@@ -290,13 +295,25 @@ impl TorrentStateInitializing {
             &self.metadata.file_infos,
         );
 
-        let chunk_tracker = ChunkTracker::new(
+        let mut chunk_tracker = ChunkTracker::new(
             have_pieces.into_dyn(),
             selected_pieces,
             *self.metadata.lengths(),
             &self.metadata.file_infos,
         )
         .context("error creating chunk tracker")?;
+        if let Some(priorities) = self.piece_priorities.as_ref() {
+            let lengths = self.metadata.lengths();
+            chunk_tracker.set_piece_priorities(
+                priorities
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p != PiecePriority::Normal)
+                    .filter_map(|(idx, p)| {
+                        Some((lengths.validate_piece_index(idx.try_into().ok()?)?, *p))
+                    }),
+            );
+        }
 
         let hns = chunk_tracker.get_hns();
 

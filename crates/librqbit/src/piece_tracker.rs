@@ -298,6 +298,14 @@ impl PieceTracker {
         self.chunks.update_only_files(file_infos, new_only_files)
     }
 
+    /// Set the fetch priority of the given pieces.
+    pub fn set_piece_priorities(
+        &mut self,
+        priorities: impl IntoIterator<Item = (ValidPieceIndex, crate::piece_priority::PiecePriority)>,
+    ) -> crate::chunk_tracker::HaveNeededSelected {
+        self.chunks.set_piece_priorities(priorities)
+    }
+
     /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
     pub fn update_file_have_on_piece_completed(
         &mut self,
@@ -800,5 +808,126 @@ mod tests {
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }
+    }
+
+    // Every piece one peer would be handed in turn, until none is left for it.
+    fn drain_for_peer(
+        tracker: &mut PieceTracker,
+        file_infos: &FileInfos,
+        peer_has_piece: impl Fn(ValidPieceIndex) -> bool,
+    ) -> Vec<u32> {
+        let file_priorities = make_default_file_priorities(file_infos);
+        let mut order = Vec::new();
+        loop {
+            match tracker.acquire_piece(AcquireRequest {
+                peer: peer(1),
+                peer_avg_time: None,
+                priority_pieces: std::iter::empty(),
+                file_priorities: &file_priorities,
+                file_infos,
+                peer_has_piece: &peer_has_piece,
+                can_steal: |_| true,
+            }) {
+                AcquireResult::Reserved(p) => order.push(p.get()),
+                AcquireResult::NoneAvailable => return order,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    fn pri(tracker: &mut PieceTracker, set: &[(u32, PiecePriority)]) {
+        let lengths = *tracker.chunks().get_lengths();
+        tracker.set_piece_priorities(
+            set.iter()
+                .map(|(i, p)| (lengths.validate_piece_index(*i).unwrap(), *p)),
+        );
+    }
+
+    use crate::piece_priority::PiecePriority;
+
+    #[test]
+    fn test_all_normal_keeps_file_order() {
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(5));
+        let file_infos = make_test_file_infos(5);
+        // First and last piece of the file first, then the rest in order.
+        assert_eq!(
+            drain_for_peer(&mut tracker, &file_infos, |_| true),
+            vec![0, 4, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn test_higher_priority_levels_are_handed_out_first() {
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(6));
+        let file_infos = make_test_file_infos(6);
+        pri(
+            &mut tracker,
+            &[
+                (0, PiecePriority::Low),
+                (2, PiecePriority::High),
+                (3, PiecePriority::Critical),
+                (4, PiecePriority::High),
+            ],
+        );
+        // Critical, then High in file order (first/last first: 2 before 4 here as
+        // neither is the file's first or last piece), then Normal, then Low.
+        assert_eq!(
+            drain_for_peer(&mut tracker, &file_infos, |_| true),
+            vec![3, 2, 4, 5, 1, 0]
+        );
+    }
+
+    #[test]
+    fn test_a_higher_piece_the_peer_lacks_does_not_hold_up_lower_ones() {
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(4));
+        let file_infos = make_test_file_infos(4);
+        pri(&mut tracker, &[(2, PiecePriority::Critical)]);
+        // This peer has everything but the critical piece: it gets the rest.
+        assert_eq!(
+            drain_for_peer(&mut tracker, &file_infos, |p| p.get() != 2),
+            vec![0, 3, 1]
+        );
+        // The critical piece is still waiting for a peer that has it.
+        assert_eq!(drain_for_peer(&mut tracker, &file_infos, |_| true), vec![2]);
+    }
+
+    #[test]
+    fn test_raising_a_queued_piece_reorders_the_queue() {
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(5));
+        let file_infos = make_test_file_infos(5);
+        pri(&mut tracker, &[(3, PiecePriority::High)]);
+        assert_eq!(
+            drain_for_peer(&mut tracker, &file_infos, |p| p.get() == 3 || p.get() == 1),
+            vec![3, 1]
+        );
+        pri(
+            &mut tracker,
+            &[(3, PiecePriority::Normal), (2, PiecePriority::High)],
+        );
+        assert_eq!(
+            drain_for_peer(&mut tracker, &file_infos, |_| true),
+            vec![2, 0, 4]
+        );
+    }
+
+    #[test]
+    fn test_skip_drops_a_piece_from_what_is_needed_and_back() {
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(4));
+        let file_infos = make_test_file_infos(4);
+        let piece_len = 16384u64;
+        let full = tracker.chunks().get_hns().needed_bytes;
+
+        pri(&mut tracker, &[(1, PiecePriority::Skip)]);
+        assert_eq!(tracker.chunks().get_hns().needed_bytes, full - piece_len);
+        assert_eq!(tracker.chunks().get_hns().selected_bytes, full - piece_len);
+        assert_eq!(
+            drain_for_peer(&mut tracker, &file_infos, |_| true),
+            vec![0, 3, 2]
+        );
+
+        // Wanted again: it is queued again, at the priority it is given.
+        pri(&mut tracker, &[(1, PiecePriority::Low)]);
+        assert_eq!(tracker.chunks().get_hns().needed_bytes, full);
+        assert_eq!(drain_for_peer(&mut tracker, &file_infos, |_| true), vec![1]);
     }
 }
