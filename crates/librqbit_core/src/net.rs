@@ -30,12 +30,11 @@ pub trait DatagramSocket: Send + Sync + 'static {
     /// The local address the socket is bound to.
     fn bind_addr(&self) -> SocketAddr;
 
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8])
+    -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
 
-    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFuture<'a, io::Result<usize>>;
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr)
+    -> BoxFuture<'a, io::Result<usize>>;
 
     fn poll_send_to(
         &self,
@@ -74,7 +73,11 @@ impl DatagramSocket for tokio::net::UdpSocket {
         Box::pin(tokio::net::UdpSocket::recv_from(self, buf))
     }
 
-    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFuture<'a, io::Result<usize>> {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
         Box::pin(tokio::net::UdpSocket::send_to(self, buf, target))
     }
 
@@ -85,5 +88,34 @@ impl DatagramSocket for tokio::net::UdpSocket {
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
         tokio::net::UdpSocket::poll_send_to(self, cx, buf, target)
+    }
+}
+
+/// Resolves a hostname to socket addresses.
+///
+/// Used for DHT bootstrap nodes and UDP trackers. Embedders that route traffic
+/// through their own network stack can inject one so that lookups go through
+/// that stack too, instead of the host's resolver.
+pub trait Resolver: Send + Sync + 'static {
+    /// Resolve `host` (a domain name, without port or brackets) and return
+    /// every address found, each carrying `port`.
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>>;
+}
+
+/// The host's resolver, via [`tokio::net::lookup_host`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
     }
 }
