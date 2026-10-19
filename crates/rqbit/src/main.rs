@@ -694,6 +694,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         http_client: None,
         socket_factory: None,
         tracker_stopped_timeout: None,
+        encryption: librqbit::EncryptionPolicy::Disabled,
     };
 
     #[allow(clippy::needless_update)]

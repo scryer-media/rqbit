@@ -1,14 +1,19 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
+use futures::TryFutureExt;
+use librqbit_core::hash_id::Id20;
 use librqbit_dualstack_sockets::ConnectOpts;
 use librqbit_utp::BindDevice;
 use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 use crate::{
     Error, PeerConnectionOptions, Result,
+    mse::{self, EncryptionPolicy},
     network::{SocketFactory, UtpSocket},
+    peer_connection::with_timeout,
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
     vectored_traits::AsyncReadVectoredIntoCompat,
 };
@@ -67,6 +72,7 @@ pub(crate) struct StreamConnectorArgs {
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
     pub socket_factory: Option<Arc<dyn SocketFactory>>,
+    pub encryption: EncryptionPolicy,
 }
 
 impl SocksProxyConfig {
@@ -123,10 +129,21 @@ gen_stats!(PerFamilyAtomic PerFamilySnapshot, [], [
     v4 SingleStatAtomic SingleStatSnapshot,
     v6 SingleStatAtomic SingleStatSnapshot
 ]);
+// Outgoing encrypted handshakes: how many were tried, how many ended in a
+// fully encrypted or header-only stream, how many failed, and how many of
+// those failures were retried in plaintext.
+gen_stats!(EncryptionStatsAtomic EncryptionStatsSnapshot, [
+    attempts u64,
+    rc4 u64,
+    header_only u64,
+    failures u64,
+    plaintext_fallbacks u64
+], []);
 gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
     socks PerFamilyAtomic PerFamilySnapshot,
     tcp PerFamilyAtomic PerFamilySnapshot,
-    utp PerFamilyAtomic PerFamilySnapshot
+    utp PerFamilyAtomic PerFamilySnapshot,
+    encryption EncryptionStatsAtomic EncryptionStatsSnapshot
 ]);
 
 /// An outgoing TCP connection: a kernel socket, or streams from a `SocketFactory`.
@@ -144,6 +161,7 @@ pub(crate) struct StreamConnector {
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
     socket_factory: Option<Arc<dyn SocketFactory>>,
+    encryption: EncryptionPolicy,
 }
 
 impl StreamConnector {
@@ -170,7 +188,71 @@ impl StreamConnector {
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
             socket_factory: config.socket_factory,
+            encryption: config.encryption,
         })
+    }
+
+    pub fn encryption(&self) -> EncryptionPolicy {
+        self.encryption
+    }
+
+    /// Connect to a peer and send it our BitTorrent `handshake`, through the
+    /// encrypted handshake when the policy asks for it. The returned halves
+    /// carry the peer's reply.
+    pub async fn connect_and_send_handshake(
+        &self,
+        addr: SocketAddr,
+        info_hash: &Id20,
+        handshake: &[u8],
+        connect_timeout: Duration,
+        rw_timeout: Duration,
+    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+        let connect = || with_timeout("connecting", connect_timeout, self.connect(addr));
+        let send_plaintext = |kind, r, mut w: BoxAsyncWrite| async move {
+            with_timeout(
+                "writing",
+                rw_timeout,
+                w.write_all(handshake).map_err(Error::WriteHandshake),
+            )
+            .await?;
+            Ok((kind, r, w))
+        };
+
+        if self.encryption == EncryptionPolicy::Disabled {
+            let (kind, r, w) = connect().await?;
+            return send_plaintext(kind, r, w).await;
+        }
+
+        let stats = &self.stats.encryption;
+        let (kind, r, w) = connect().await?;
+        stats.attempts(1);
+        let offer = mse::outgoing_offer(self.encryption);
+        let encrypted = with_timeout("encryption handshake", rw_timeout, async {
+            Ok(mse::initiate(r, w, info_hash, offer, handshake).await?)
+        })
+        .await;
+        let err = match encrypted {
+            Ok(e) => {
+                if e.method == mse::CRYPTO_RC4 {
+                    stats.rc4(1);
+                } else {
+                    stats.header_only(1);
+                }
+                return Ok((kind, e.reader, e.writer));
+            }
+            Err(e) => e,
+        };
+        stats.failures(1);
+        if self.encryption == EncryptionPolicy::Require {
+            return Err(err);
+        }
+        debug!(
+            ?addr,
+            "encrypted handshake failed, retrying in plaintext: {err:#}"
+        );
+        stats.plaintext_fallbacks(1);
+        let (kind, r, w) = connect().await?;
+        send_plaintext(kind, r, w).await
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {

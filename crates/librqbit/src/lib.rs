@@ -61,6 +61,7 @@ mod ip_ranges;
 pub mod limits;
 mod listen;
 mod merge_streams;
+mod mse;
 pub mod network;
 mod peer_connection;
 mod peer_info_reader;
@@ -92,6 +93,7 @@ pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use listen::{ListenerMode, ListenerOptions};
+pub use mse::{EncryptionPolicy, MseError};
 pub use network::{SocketFactory, StreamListener};
 pub use peer_connection::PeerConnectionOptions;
 pub use piece_priority::PiecePriority;

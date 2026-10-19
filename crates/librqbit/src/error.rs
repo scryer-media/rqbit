@@ -26,6 +26,13 @@ pub enum Error {
     #[error("TCP connections disabled")]
     TcpDisabled,
 
+    #[error("encryption handshake failed: {0:#}")]
+    Mse(
+        #[from]
+        #[source]
+        crate::mse::MseError,
+    ),
+
     #[error("wrong info hash")]
     WrongInfoHash,
     #[error("connecting to ourselves")]

@@ -212,7 +212,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
         let rwtimeout = self
             .options
             .read_write_timeout
@@ -223,28 +222,26 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connect_timeout
             .unwrap_or_else(|| Duration::from_secs(10));
 
+        let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
+        let handshake = Handshake::new(self.info_hash, self.peer_id);
+        let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
+
+        // Connecting includes sending our handshake: an encrypted connection
+        // carries it inside the encryption handshake.
         let now = Instant::now();
-        let (ckind, mut read, mut write) = with_timeout(
-            "connecting",
-            connect_timeout,
-            self.connector.connect(self.addr),
-        )
-        .await?;
+        let (ckind, mut read, write) = self
+            .connector
+            .connect_and_send_handshake(
+                self.addr,
+                &self.info_hash,
+                &write_buf[..hsz],
+                connect_timeout,
+                rwtimeout,
+            )
+            .await?;
 
         async move {
             self.handler.on_connected(now.elapsed());
-
-            let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-            let handshake = Handshake::new(self.info_hash, self.peer_id);
-            let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write
-                    .write_all(&write_buf[..hsz])
-                    .map_err(Error::WriteHandshake),
-            )
-            .await?;
 
             let mut read_buf = ReadBuf::new();
             let h = read_buf.read_handshake(&mut read, rwtimeout).await?;

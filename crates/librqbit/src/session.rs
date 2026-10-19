@@ -550,6 +550,10 @@ pub struct SessionOptions {
     /// does not apply to it. If HTTP hostname lookups must be routed too, build
     /// the client with its own resolver (`reqwest::ClientBuilder::dns_resolver`).
     pub http_client: Option<reqwest::Client>,
+
+    /// Message stream encryption for peer connections, outgoing and incoming.
+    /// Defaults to [`EncryptionPolicy::Disabled`](crate::EncryptionPolicy::Disabled).
+    pub encryption: crate::mse::EncryptionPolicy,
 }
 
 impl Default for SessionOptions {
@@ -581,6 +585,7 @@ impl Default for SessionOptions {
             client_name_and_version: None,
             socket_factory: None,
             http_client: None,
+            encryption: crate::mse::EncryptionPolicy::Disabled,
         }
     }
 }
@@ -894,6 +899,7 @@ impl Session {
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
                     socket_factory: opts.socket_factory.clone(),
+                    encryption: opts.encryption,
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -1124,6 +1130,27 @@ impl Session {
                 .fetch_add(1, Ordering::Relaxed);
             bail!("Incoming ip {incoming_ip} is not in allowlist");
         }
+
+        // With encryption enabled, an encrypted connection is unwrapped here
+        // and a plaintext one passed through (or refused); with it disabled
+        // the halves are left as they are.
+        let mut writer = writer;
+        crate::mse::upgrade_incoming(
+            self.connector.encryption(),
+            &mut reader,
+            &mut writer,
+            rwtimeout,
+            || {
+                self.db
+                    .read()
+                    .torrents
+                    .values()
+                    .map(|t| t.info_hash())
+                    .collect()
+            },
+        )
+        .await
+        .context("error in the encryption handshake")?;
 
         let mut read_buf = ReadBuf::new();
         let h = read_buf
