@@ -41,6 +41,8 @@ impl TorrentsTableRecord {
                     .only_files
                     .map(|v| v.into_iter().map(|v| v as usize).collect()),
                 is_paused: self.is_paused,
+                // The table has no column for the per-torrent rate limits.
+                ratelimits: Default::default(),
             },
         ))
     }

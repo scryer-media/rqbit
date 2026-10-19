@@ -40,7 +40,7 @@ use tracing::warn;
 use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
-use crate::limits::LimitsConfig;
+use crate::limits::{Limits, LimitsConfig};
 use crate::piece_priority::{PiecePriority, validate_piece_priorities};
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
@@ -118,7 +118,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_max_request_window: Option<usize>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
-    pub ratelimits: LimitsConfig,
+    // The torrent's own rate limits. Every live run acquires through this one
+    // object, so a change reaches the running peers and outlives pause/unpause.
+    pub ratelimits: Limits,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
     #[cfg(feature = "disable-upload")]
@@ -319,6 +321,19 @@ impl ManagedTorrent {
             all[index.get_usize()] = priority;
         }
         Ok(())
+    }
+
+    /// The torrent's upload and download caps; None is unlimited.
+    pub fn ratelimits(&self) -> LimitsConfig {
+        self.shared.options.ratelimits.get_config()
+    }
+
+    /// Change the torrent's upload and download caps (None is unlimited). Takes
+    /// effect on the next acquire of every connected peer, without reconnecting,
+    /// and is kept across pause/unpause. Use `Session::update_ratelimits` to also
+    /// persist it.
+    pub fn set_ratelimits(&self, limits: LimitsConfig) {
+        self.shared.options.ratelimits.set_config(limits);
     }
 
     pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut ManagedTorrentState) -> R) -> R {

@@ -13,8 +13,8 @@ use librqbit_core::magnet::Magnet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    AddTorrent, AddTorrentOptions, bitv_factory::BitVFactory, session::TorrentId,
-    torrent_state::ManagedTorrentHandle,
+    AddTorrent, AddTorrentOptions, bitv_factory::BitVFactory, limits::LimitsConfig,
+    session::TorrentId, torrent_state::ManagedTorrentHandle,
 };
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -30,6 +30,8 @@ pub struct SerializedTorrent {
     output_folder: PathBuf,
     only_files: Option<Vec<usize>>,
     is_paused: bool,
+    #[serde(default)]
+    ratelimits: LimitsConfig,
 }
 
 impl SerializedTorrent {
@@ -59,6 +61,7 @@ impl SerializedTorrent {
             ),
             only_files: self.only_files,
             overwrite: true,
+            ratelimits: self.ratelimits,
             ..Default::default()
         };
 

@@ -1613,7 +1613,7 @@ impl Session {
                     peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
                     output_folder,
-                    ratelimits: opts.ratelimits,
+                    ratelimits: Limits::new(opts.ratelimits),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     #[cfg(feature = "disable-upload")]
@@ -1886,6 +1886,18 @@ impl Session {
         only_files: &HashSet<usize>,
     ) -> anyhow::Result<()> {
         handle.update_only_files(only_files)?;
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Change a torrent's upload and download caps while it runs (see
+    /// `ManagedTorrent::set_ratelimits`) and persist them.
+    pub async fn update_ratelimits(
+        &self,
+        handle: &ManagedTorrentHandle,
+        limits: LimitsConfig,
+    ) -> anyhow::Result<()> {
+        handle.set_ratelimits(limits);
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
