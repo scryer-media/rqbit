@@ -175,7 +175,7 @@ impl TestHarness {
                     ..Default::default()
                 }),
                 ratelimits: LimitsConfig {
-                    upload_bps: NonZero::new(64 * 1024),
+                    upload_bps: NonZero::new(64 * 1024).into(),
                     download_bps: Default::default(),
                 },
                 disable_local_service_discovery: false,

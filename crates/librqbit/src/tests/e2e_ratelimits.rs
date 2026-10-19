@@ -54,8 +54,8 @@ async fn test_download_cap_changes_while_the_torrent_runs() -> anyhow::Result<()
 
     // Set while paused: the live run started by unpause must pick it up.
     let low = LimitsConfig {
-        upload_bps: None,
-        download_bps: NonZeroU32::new(PIECE_LENGTH),
+        upload_bps: Default::default(),
+        download_bps: NonZeroU32::new(PIECE_LENGTH).into(),
     };
     session.update_ratelimits(&handle, low).await?;
     assert_eq!(handle.ratelimits(), low);
@@ -78,8 +78,8 @@ async fn test_download_cap_changes_while_the_torrent_runs() -> anyhow::Result<()
 
     // Raise the cap on the running torrent: same live state, same peer connection.
     let high = LimitsConfig {
-        upload_bps: None,
-        download_bps: NonZeroU32::new(1 << 30),
+        upload_bps: Default::default(),
+        download_bps: NonZeroU32::new(1 << 30).into(),
     };
     session.update_ratelimits(&handle, high).await?;
     assert_eq!(handle.ratelimits(), high);

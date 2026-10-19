@@ -1,4 +1,3 @@
-use arc_swap::ArcSwapOption;
 use governor::DefaultDirectRateLimiter as RateLimiter;
 use governor::Quota;
 use librqbit_core::constants::CHUNK_SIZE;
@@ -7,61 +6,128 @@ use serde::Serialize;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+/// One direction's limit. Serialized as a number of bytes per second, with
+/// `null` for unlimited and `0` for closed, so rows written when the field was
+/// an `Option<NonZeroU32>` read back unchanged.
 #[derive(Default, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(from = "Option<u32>", into = "Option<u32>")]
+pub enum LimitKind {
+    #[default]
+    Unlimited,
+    /// No bytes are granted until the limit is set to a rate or unlimited.
+    Closed,
+    Bps(NonZeroU32),
+}
+
+impl From<Option<u32>> for LimitKind {
+    fn from(bps: Option<u32>) -> Self {
+        match bps {
+            None => Self::Unlimited,
+            Some(bps) => NonZeroU32::new(bps).map_or(Self::Closed, Self::Bps),
+        }
+    }
+}
+
+impl From<LimitKind> for Option<u32> {
+    fn from(kind: LimitKind) -> Self {
+        match kind {
+            LimitKind::Unlimited => None,
+            LimitKind::Closed => Some(0),
+            LimitKind::Bps(bps) => Some(bps.get()),
+        }
+    }
+}
+
+impl From<Option<NonZeroU32>> for LimitKind {
+    fn from(bps: Option<NonZeroU32>) -> Self {
+        bps.map_or(Self::Unlimited, Self::Bps)
+    }
+}
+
+#[derive(Default, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default)]
 pub struct LimitsConfig {
-    pub upload_bps: Option<NonZeroU32>,
-    pub download_bps: Option<NonZeroU32>,
+    pub upload_bps: LimitKind,
+    pub download_bps: LimitKind,
+}
+
+// The limit and the governor built for it, swapped together so an acquire never
+// sees one without the other.
+#[derive(Clone)]
+struct LimitState {
+    kind: LimitKind,
+    limiter: Option<Arc<RateLimiter>>,
+}
+
+impl LimitState {
+    // The burst holds at least one full request (a request never exceeds
+    // CHUNK_SIZE), so a rate below that makes an acquire wait, never fail.
+    fn new(kind: LimitKind) -> Self {
+        let limiter = match kind {
+            LimitKind::Bps(bps) => {
+                let burst = bps.max(NonZeroU32::new(CHUNK_SIZE).expect("CHUNK_SIZE is not zero"));
+                Some(Arc::new(RateLimiter::direct(
+                    Quota::per_second(bps).allow_burst(burst),
+                )))
+            }
+            LimitKind::Unlimited | LimitKind::Closed => None,
+        };
+        Self { kind, limiter }
+    }
 }
 
 struct Limit {
-    // Loaded afresh by every acquire, so a rate set while acquires run applies
-    // from the next one on.
-    limiter: ArcSwapOption<RateLimiter>,
-    current_bps: std::sync::atomic::AtomicU32,
+    // Every acquire watches this, so a change set while acquires wait reaches
+    // them at once.
+    state: tokio::sync::watch::Sender<LimitState>,
     // Bytes this limit has let through.
     granted: tokio::sync::watch::Sender<u64>,
 }
 
 impl Limit {
-    // The burst holds at least one full request (a request never exceeds
-    // CHUNK_SIZE), so a rate below that makes an acquire wait, never fail.
-    fn new_inner(bps: Option<NonZeroU32>) -> Option<Arc<RateLimiter>> {
-        let bps = bps?;
-        let burst = bps.max(NonZeroU32::new(CHUNK_SIZE).expect("CHUNK_SIZE is not zero"));
-        Some(Arc::new(RateLimiter::direct(
-            Quota::per_second(bps).allow_burst(burst),
-        )))
-    }
-
-    fn new(bps: Option<NonZeroU32>) -> Self {
-        use std::sync::atomic::AtomicU32;
+    fn new(kind: LimitKind) -> Self {
         Self {
-            limiter: ArcSwapOption::new(Self::new_inner(bps)),
-            current_bps: AtomicU32::new(bps.map(|v| v.get()).unwrap_or(0)),
+            state: tokio::sync::watch::Sender::new(LimitState::new(kind)),
             granted: tokio::sync::watch::Sender::new(0),
         }
     }
 
+    // Waits for the current limit to grant `size` bytes. A closed limit grants
+    // nothing; any change to the limit restarts the wait against the new one.
     async fn acquire(&self, size: NonZeroU32) -> crate::Result<()> {
-        let lim = self.limiter.load().clone();
-        if let Some(rl) = lim.as_ref() {
-            rl.until_n_ready(size).await?;
+        let mut state = self.state.subscribe();
+        loop {
+            let current = state.borrow_and_update().clone();
+            let grant = async {
+                if current.kind == LimitKind::Closed {
+                    std::future::pending::<()>().await;
+                }
+                if let Some(rl) = current.limiter.as_ref() {
+                    rl.until_n_ready(size).await?;
+                }
+                crate::Result::Ok(())
+            };
+            tokio::select! {
+                biased;
+                res = grant => {
+                    res?;
+                    break;
+                }
+                res = state.changed() => {
+                    res.expect("the sender lives as long as the limit");
+                }
+            }
         }
         self.granted.send_modify(|g| *g += u64::from(size.get()));
         Ok(())
     }
 
-    fn set(&self, limit: Option<NonZeroU32>) {
-        use std::sync::atomic::Ordering;
-        let new = Self::new_inner(limit);
-        self.limiter.swap(new);
-        self.current_bps
-            .store(limit.map(|v| v.get()).unwrap_or(0), Ordering::Relaxed);
+    fn set(&self, kind: LimitKind) {
+        self.state.send_replace(LimitState::new(kind));
     }
 
-    fn get(&self) -> Option<NonZeroU32> {
-        use std::sync::atomic::Ordering;
-        NonZeroU32::new(self.current_bps.load(Ordering::Relaxed))
+    fn get(&self) -> LimitKind {
+        self.state.borrow().kind
     }
 }
 
@@ -92,19 +158,19 @@ impl Limits {
         self.down.acquire(len).await
     }
 
-    pub fn set_upload_bps(&self, bps: Option<NonZeroU32>) {
-        self.up.set(bps);
+    pub fn set_upload_bps(&self, bps: impl Into<LimitKind>) {
+        self.up.set(bps.into());
     }
 
-    pub fn set_download_bps(&self, bps: Option<NonZeroU32>) {
-        self.down.set(bps);
+    pub fn set_download_bps(&self, bps: impl Into<LimitKind>) {
+        self.down.set(bps.into());
     }
 
-    pub fn get_upload_bps(&self) -> Option<NonZeroU32> {
+    pub fn get_upload_bps(&self) -> LimitKind {
         self.up.get()
     }
 
-    pub fn get_download_bps(&self) -> Option<NonZeroU32> {
+    pub fn get_download_bps(&self) -> LimitKind {
         self.down.get()
     }
 
@@ -115,8 +181,8 @@ impl Limits {
         }
     }
 
-    /// Set both rates. Acquires already waiting finish against the old rate;
-    /// every later one uses the new one.
+    /// Set both limits. Acquires already waiting, including those held by a
+    /// closed limit, continue against the new limits.
     pub fn set_config(&self, config: LimitsConfig) {
         self.set_upload_bps(config.upload_bps);
         self.set_download_bps(config.download_bps);
@@ -140,10 +206,10 @@ mod tests {
     use futures::FutureExt;
     use librqbit_core::constants::CHUNK_SIZE;
 
-    use super::{Limits, LimitsConfig};
+    use super::{LimitKind, Limits, LimitsConfig};
 
-    fn bps(v: u32) -> Option<NonZeroU32> {
-        NonZeroU32::new(v)
+    fn bps(v: u32) -> LimitKind {
+        LimitKind::Bps(NonZeroU32::new(v).unwrap())
     }
 
     // Each limiter starts with a full burst of max(rate, CHUNK_SIZE). Whether an
@@ -153,7 +219,7 @@ mod tests {
     #[test]
     fn test_a_rate_change_applies_to_the_next_acquire() {
         let limits = Limits::new(LimitsConfig {
-            upload_bps: None,
+            upload_bps: LimitKind::Unlimited,
             download_bps: bps(1024),
         });
         let chunk = NonZeroU32::new(CHUNK_SIZE).unwrap();
@@ -226,7 +292,7 @@ mod tests {
             // Independent of the clock: the quota has capacity for a full request
             // (Ok, whether ready now or later), never InsufficientCapacity.
             for limit in [&limits.up, &limits.down] {
-                let rl = limit.limiter.load_full().expect("capped");
+                let rl = limit.state.borrow().limiter.clone().expect("capped");
                 assert!(rl.check_n(chunk).is_ok(), "insufficient capacity");
             }
             // A rate change refills the burst.
@@ -235,5 +301,102 @@ mod tests {
                 download_bps: bps(1024),
             });
         }
+    }
+
+    fn closed_down() -> LimitsConfig {
+        LimitsConfig {
+            upload_bps: LimitKind::Unlimited,
+            download_bps: LimitKind::Closed,
+        }
+    }
+
+    // A closed limit holds an acquire with no error; opening it to a rate or to
+    // unlimited releases the same waiting acquire.
+    #[test]
+    fn test_a_closed_limit_holds_until_it_opens() {
+        let chunk = NonZeroU32::new(CHUNK_SIZE).unwrap();
+        for open in [bps(CHUNK_SIZE), LimitKind::Unlimited] {
+            let limits = Limits::new(closed_down());
+            let granted = limits.watch_download_granted();
+            let mut waiting = std::pin::pin!(limits.prepare_for_download(chunk));
+            assert!((&mut waiting).now_or_never().is_none());
+            assert!((&mut waiting).now_or_never().is_none());
+            assert_eq!(*granted.borrow(), 0);
+            // The other direction is untouched.
+            assert!(matches!(
+                limits.prepare_for_upload(chunk).now_or_never(),
+                Some(Ok(()))
+            ));
+
+            limits.set_download_bps(open);
+            assert!(matches!((&mut waiting).now_or_never(), Some(Ok(()))));
+            assert_eq!(*granted.borrow(), u64::from(CHUNK_SIZE));
+            assert_eq!(limits.get_download_bps(), open);
+        }
+    }
+
+    // Closing a running limit stops the acquires already waiting on its rate;
+    // a rate again releases them.
+    #[test]
+    fn test_closing_a_rate_holds_waiting_acquires_until_it_reopens() {
+        let limits = Limits::new(LimitsConfig {
+            upload_bps: LimitKind::Unlimited,
+            download_bps: bps(1024),
+        });
+        let chunk = NonZeroU32::new(CHUNK_SIZE).unwrap();
+        let granted = limits.watch_download_granted();
+        assert!(matches!(
+            limits.prepare_for_download(chunk).now_or_never(),
+            Some(Ok(()))
+        ));
+        // The burst is spent: this one waits inside the governor.
+        let mut first = std::pin::pin!(limits.prepare_for_download(chunk));
+        assert!((&mut first).now_or_never().is_none());
+
+        limits.set_config(closed_down());
+        let mut second = std::pin::pin!(limits.prepare_for_download(chunk));
+        assert!((&mut first).now_or_never().is_none());
+        assert!((&mut second).now_or_never().is_none());
+        assert_eq!(*granted.borrow(), u64::from(CHUNK_SIZE));
+        assert_eq!(limits.get_config(), closed_down());
+
+        // A fresh burst of two requests releases both.
+        limits.set_download_bps(bps(2 * CHUNK_SIZE));
+        assert!(matches!((&mut first).now_or_never(), Some(Ok(()))));
+        assert!(matches!((&mut second).now_or_never(), Some(Ok(()))));
+        assert_eq!(*granted.borrow(), 3 * u64::from(CHUNK_SIZE));
+    }
+
+    #[test]
+    fn test_limits_serialize_as_optional_bps() {
+        for (config, json) in [
+            (
+                LimitsConfig::default(),
+                r#"{"upload_bps":null,"download_bps":null}"#,
+            ),
+            (closed_down(), r#"{"upload_bps":null,"download_bps":0}"#),
+            (
+                LimitsConfig {
+                    upload_bps: bps(512),
+                    download_bps: bps(1024),
+                },
+                r#"{"upload_bps":512,"download_bps":1024}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&config).unwrap(), json);
+            assert_eq!(serde_json::from_str::<LimitsConfig>(json).unwrap(), config);
+        }
+        // Rows written before the field could be closed: absent or Option<NonZeroU32>.
+        assert_eq!(
+            serde_json::from_str::<LimitsConfig>("{}").unwrap(),
+            LimitsConfig::default()
+        );
+        assert_eq!(
+            serde_json::from_str::<LimitsConfig>(r#"{"download_bps":1024}"#).unwrap(),
+            LimitsConfig {
+                upload_bps: LimitKind::Unlimited,
+                download_bps: bps(1024),
+            }
+        );
     }
 }

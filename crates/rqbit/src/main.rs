@@ -679,8 +679,8 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         #[cfg(feature = "disable-upload")]
         disable_upload: opts.disable_upload,
         ratelimits: LimitsConfig {
-            upload_bps: opts.ratelimit_upload_bps,
-            download_bps: opts.ratelimit_download_bps,
+            upload_bps: opts.ratelimit_upload_bps.into(),
+            download_bps: opts.ratelimit_download_bps.into(),
         },
         blocklist_url: opts.blocklist_url.take(),
         allowlist_url: opts.allowlist_url.take(),
