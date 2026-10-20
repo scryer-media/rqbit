@@ -71,7 +71,10 @@ use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::{
+    sync::{CancellationToken, DropGuard},
+    task::TaskTracker,
+};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use tracker_comms::{StoppedAnnounces, TrackerComms, UdpTrackerClient};
 
@@ -128,6 +131,8 @@ pub struct Session {
     // Lifecycle management
     cancellation_token: CancellationToken,
     _cancellation_token_drop_guard: DropGuard,
+    // Every task the session spawns and the DHT's worker: stop() returns once they are gone.
+    tasks: TaskTracker,
 
     // Runtime settings
     output_folder: PathBuf,
@@ -715,6 +720,7 @@ impl Session {
                 .peer_id
                 .unwrap_or_else(|| generate_azereus_style(*b"rQ", crate_version!()));
             let token = opts.cancellation_token.take().unwrap_or_default();
+            let tasks = TaskTracker::new();
 
             #[cfg(feature = "disable-upload")]
             if opts.disable_upload {
@@ -771,6 +777,7 @@ impl Session {
                             resolver: dht_resolver,
                             node_id_prefix: dht_node_id_prefix,
                             client_version: dht_client_version,
+                            tasks: Some(tasks.clone()),
                             ..Default::default()
                         },
                     )
@@ -787,6 +794,7 @@ impl Session {
                         resolver: dht_resolver,
                         node_id_prefix: dht_node_id_prefix,
                         client_version: dht_client_version,
+                        tasks: Some(tasks.clone()),
                         ..Default::default()
                     })
                     .await
@@ -972,6 +980,7 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
+                tasks,
                 announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
@@ -1275,7 +1284,12 @@ impl Session {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        spawn_with_cancel(
+            span,
+            name,
+            self.cancellation_token.clone(),
+            self.tasks.track_future(fut),
+        );
     }
 
     pub(crate) fn rs(&self) -> Option<tracing::Id> {
@@ -1305,8 +1319,8 @@ impl Session {
             debug!("not every tracker heard stopped before shutdown");
         }
         self.cancellation_token.cancel();
-        // this sucks, but hopefully will be enough
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// Run a callback given the currently managed torrents.

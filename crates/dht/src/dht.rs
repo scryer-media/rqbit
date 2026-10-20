@@ -41,7 +41,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel};
 
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
 fn now() -> Instant {
@@ -1383,6 +1383,9 @@ pub struct DhtConfig<'a> {
     /// letters followed by two version bytes. Sent with every outgoing message
     /// when set; when not, no "v" is sent.
     pub client_version: Option<Vec<u8>>,
+    /// Track the DHT's worker in this tracker. The worker owns the socket, so once the
+    /// tracker is empty after cancellation, the socket is gone.
+    pub tasks: Option<TaskTracker>,
 }
 
 // A node id starting with `prefix` (at most 20 bytes of it), the rest random.
@@ -1472,14 +1475,15 @@ impl DhtState {
                 {
                     let state = state.clone();
                     let resolver = config.resolver.take();
-                    async move {
+                    let worker = async move {
                         let worker = DhtWorker {
                             socket,
                             resolver,
                             dht: state,
                         };
                         worker.start(in_rx, &bootstrap_addrs).await
-                    }
+                    };
+                    config.tasks.unwrap_or_default().track_future(worker)
                 },
             );
             Ok(state)

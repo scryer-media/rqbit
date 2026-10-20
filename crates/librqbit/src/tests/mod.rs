@@ -5,6 +5,7 @@ mod e2e_initial_have;
 mod e2e_mse;
 mod e2e_piece_priority;
 mod e2e_ratelimits;
+mod e2e_session_stop;
 mod e2e_socket_factory;
 mod e2e_stream;
 mod e2e_tracker_announces;
