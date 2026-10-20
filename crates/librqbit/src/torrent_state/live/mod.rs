@@ -198,7 +198,7 @@ pub struct TorrentStateLive {
     peer_queue_tx: UnboundedSender<SocketAddr>,
 
     finished_notify: Notify,
-    new_pieces_notify: Notify,
+    new_pieces_notify: Arc<Notify>,
     // Whether every wanted piece was already present when this run began.
     finished_at_start: bool,
 
@@ -290,7 +290,7 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
-            new_pieces_notify: Notify::new(),
+            new_pieces_notify: Arc::new(Notify::new()),
             peer_queue_tx,
             finished_notify: Notify::new(),
             finished_at_start,
@@ -1476,19 +1476,28 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
-                let result = pieces.acquire_piece(AcquireRequest {
-                    peer: self.addr,
-                    peer_avg_time: self.counters.average_piece_download_time(),
-                    priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
-                    file_priorities,
-                    file_infos: &self.state.metadata.file_infos,
-                    peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
-                    can_steal: |p| {
-                        self.state.per_piece_locks[p.get_usize()]
-                            .try_write()
-                            .is_some()
+                // A piece the storage has no room for waits on new_pieces_notify,
+                // which the storage rings when it has room again.
+                let result = pieces.acquire_admitted_piece(
+                    AcquireRequest {
+                        peer: self.addr,
+                        peer_avg_time: self.counters.average_piece_download_time(),
+                        priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
+                        file_priorities,
+                        file_infos: &self.state.metadata.file_infos,
+                        peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
+                        can_steal: |p| {
+                            self.state.per_piece_locks[p.get_usize()]
+                                .try_write()
+                                .is_some()
+                        },
                     },
-                });
+                    |p| {
+                        self.state
+                            .files
+                            .reserve_piece(p, &self.state.new_pieces_notify)
+                    },
+                );
 
                 match result {
                     AcquireResult::Reserved(piece) => {
@@ -2013,6 +2022,14 @@ impl PeerHandler {
                         ?addr,
                         "checksum for piece={} did not validate. disconnecting peer.", index
                     );
+                    // Before it is queued again, so the storage has let go of the failed
+                    // bytes by the time another peer is handed the piece.
+                    if let Err(e) = state.files.on_piece_hash_failed(chunk_info.piece_index) {
+                        debug!(
+                            piece = index,
+                            "file storage errored in on_piece_hash_failed(): {e:#}"
+                        );
+                    }
                     state
                         .lock_write("mark_piece_broken")
                         .get_pieces_mut()?

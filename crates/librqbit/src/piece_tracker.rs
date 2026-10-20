@@ -120,11 +120,30 @@ impl PieceTracker {
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
-    pub fn acquire_piece<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
+    #[cfg(test)]
+    pub fn acquire_piece<I, P, S>(&mut self, req: AcquireRequest<I, P, S>) -> AcquireResult
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
+    {
+        self.acquire_admitted_piece(req, |_| true)
+    }
+
+    /// [`Self::acquire_piece`], with `admit` asked of the one piece step 2 would
+    /// reserve. A piece it refuses stays queued and no other is reserved in its
+    /// place: the refusal is a lack of room, not of that piece. A steal takes a
+    /// piece already in flight, so it is never asked.
+    pub fn acquire_admitted_piece<I, P, S, A>(
+        &mut self,
+        mut req: AcquireRequest<I, P, S>,
+        admit: A,
+    ) -> AcquireResult
+    where
+        I: Iterator<Item = ValidPieceIndex>,
+        P: Fn(ValidPieceIndex) -> bool,
+        S: Fn(ValidPieceIndex) -> bool,
+        A: FnOnce(ValidPieceIndex) -> bool,
     {
         // 1. Try steal with 10x threshold (very slow peer)
         if let Some(result) = self.try_steal(&req, 10.0) {
@@ -133,26 +152,24 @@ impl PieceTracker {
 
         // 2. Try reserve from priority_pieces then queued pieces
         // First check priority pieces that aren't already downloaded or in-flight
-        for piece in &mut req.priority_pieces {
-            if !self.chunks.is_piece_have(piece)
+        let needed = req.priority_pieces.by_ref().find(|&piece| {
+            !self.chunks.is_piece_have(piece)
                 && !self.inflight.contains_key(&piece)
                 && (req.peer_has_piece)(piece)
-            {
-                return self.reserve_piece(piece, req.peer);
-            }
-        }
+        });
 
         // Then check naturally ordered queued pieces
         // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight)
-        let queued: Vec<_> = self
-            .chunks
-            .iter_queued_pieces(req.file_priorities, req.file_infos)
-            .collect();
+        let needed = needed.or_else(|| {
+            self.chunks
+                .iter_queued_pieces(req.file_priorities, req.file_infos)
+                .find(|&piece| (req.peer_has_piece)(piece))
+        });
 
-        for piece in queued {
-            if (req.peer_has_piece)(piece) {
-                return self.reserve_piece(piece, req.peer);
-            }
+        if let Some(piece) = needed
+            && admit(piece)
+        {
+            return self.reserve_piece(piece, req.peer);
         }
 
         // 3. Try steal with 3x threshold (moderately slow peer)
@@ -445,6 +462,37 @@ mod tests {
                 assert!(piece.get() >= 2, "Should have gotten a piece >= 2");
             }
             _ => panic!("Expected Reserved, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_a_refused_piece_stays_queued_and_nothing_takes_its_place() {
+        let mut tracker = PieceTracker::new(make_test_chunk_tracker(5));
+        let file_infos = make_test_file_infos(5);
+        let file_priorities = make_default_file_priorities(&file_infos);
+        let request = || AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            file_priorities: &file_priorities,
+            file_infos: &file_infos,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        };
+
+        let mut asked = Vec::new();
+        let result = tracker.acquire_admitted_piece(request(), |piece| {
+            asked.push(piece.get());
+            false
+        });
+        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+        assert_eq!(asked, vec![0]);
+        assert_eq!(tracker.inflight_count(), 0);
+
+        // With room again, the same piece is the one handed out.
+        match tracker.acquire_admitted_piece(request(), |_| true) {
+            AcquireResult::Reserved(piece) => assert_eq!(piece.get(), 0),
+            other => panic!("Expected Reserved, got {other:?}"),
         }
     }
 

@@ -34,9 +34,11 @@ use std::{
     any::{Any, TypeId},
     io::IoSlice,
     path::Path,
+    sync::Arc,
 };
 
 use librqbit_core::lengths::ValidPieceIndex;
+use tokio::sync::Notify;
 
 use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
 
@@ -177,6 +179,19 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Callback called every time a piece failed its hash check, before it is queued again.
+    /// Default implementation does nothing, but can be override in trait implementations.
+    fn on_piece_hash_failed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Asked before a queued piece is handed to a peer: whether the storage has room for it.
+    /// On false the piece stays queued and the peer waits on `room`, which the storage rings
+    /// once it has room again. Default implementation always has room.
+    fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
+        true
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -223,6 +238,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn on_piece_hash_failed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
+        (**self).on_piece_hash_failed(piece_id)
+    }
+
+    fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        (**self).reserve_piece(piece_id, room)
     }
 }
 
